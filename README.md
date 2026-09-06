@@ -593,7 +593,7 @@ work. Two folders to fill:
   the panel there).
 - **Host window width / height** on the overlay resize the helper's window for real -- its window,
   its swapchain and the panel texture cast into the game, so ReShade's own tab column gets more
-  room rather than the same pixels drawn bigger. From 0.14.0-beta.3 this applies **immediately**,
+  room rather than the same pixels drawn bigger. From 0.14.0-beta.4 this applies **immediately**,
   with no host restart, and you can equally just drag the helper window's border. The values are
   saved as `WindowWidth` / `WindowHeight` under `[DLSS5Host]` in `host64\ReShade.ini` (a different
   file from `dlss5-feed.cfg`, because it is the helper's own ReShade that reads them at startup).
@@ -1061,7 +1061,7 @@ if you prefer editing the file directly:
 | `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
-| `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.3 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
+| `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.4 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
 
 Two more live in a **different file** -- `[DLSS5Host] WindowWidth` and `WindowHeight` in
 `host64\ReShade.ini`, because the helper's own ReShade reads them when it starts. They size the

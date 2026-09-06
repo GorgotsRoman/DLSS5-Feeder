@@ -290,7 +290,8 @@ follow step 6 above for the DLSS5-Feeder side. Also point them at `host64\`'s "3
 Feeder" window (Home key in it) — the DLSS 5 add-on's full panel lives there, not in the
 game's own overlay.
 
-**Host window size** (rewritten 2026-09-06, 0.14.0-beta.3): the host window is now genuinely
+**Host window size** (rewritten 2026-09-06, 0.14.0-beta.4 -- beta.3 shipped the host half only, and
+the in-game panel stretched because the add-on re-handed its old panel texture): the host window is now genuinely
 resizable, live. Three ways in, all the same code path:
 
 - **Drag its border.** Until beta.3 the border was draggable but nothing answered `WM_SIZE`, so
