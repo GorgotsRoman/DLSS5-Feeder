@@ -50,7 +50,7 @@ static bool FeedVkFramePresentInstall(reshade::api::effect_runtime *rt)
         return false;
     }
     g_vk_frame_present_target = target;
-    Log("[feed] Vulkan present dependency hook installed at device dispatch %p (detroit-sync.1)", target);
+    Log("[feed] Vulkan present dependency hook installed at device dispatch %p", target);
     return true;
 }
 

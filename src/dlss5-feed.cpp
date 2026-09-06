@@ -62,7 +62,7 @@
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.14.0-beta.2-detroit-sync.1"
+#define FEED_VERSION "0.14.0-beta.3"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
