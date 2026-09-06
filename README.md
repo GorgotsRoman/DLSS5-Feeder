@@ -644,6 +644,14 @@ GPU-cost figures on the overlay.
 D3D9 games need a translation layer first — **[dgVoodoo2](http://dege.freeweb.hu/dgVoodoo2/)** turns
 D3D9 into D3D11, and everything after that is a normal 32-bit install.
 
+**A 64-bit D3D9 game has a second route, and it is the one to try if dgVoodoo2 crashes the game:**
+put **DXVK** (`x64\d3d9.dll`, with `dxvk.allowFse = False` in `dxvk.conf`) in front of it instead,
+install ReShade as a **Vulkan** layer, and follow the [64-bit Vulkan](#install-for-a-vulkan-game)
+steps — the existing Vulkan transport handles it with no changes. Confirmed on Darksiders II
+Deathinitive Edition, where dgVoodoo2 crashed at startup in every configuration
+([#64](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/64)). **Windows only:** it works because the
+Windows Vulkan loader reads ReShade's layer from the registry, which Proton's `winevulkan` does not do.
+
 **Not sure if you need this?** Launch the game with ReShade installed and check `ReShade.log`:
 `IDirect3DDevice9` means yes; `D3D11CreateDevice` means the game already runs on D3D11 — skip to
 [Install for a 32-bit game](#install-for-a-32-bit-game-beta).
