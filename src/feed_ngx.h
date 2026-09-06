@@ -53,6 +53,46 @@ static const char *NgxResultName(NVSDK_NGX_Result r)
 }
 
 // ---------------------------------------------------------------------------------------
+// HRESULT -> name, for the D3D12/DXGI codes this project actually hits.
+//
+// Every D3D12CreateDevice failure was logged as bare hex on all four call sites, which put
+// the burden of decoding on the reporter. Three issues arrived within a day carrying three
+// different codes (#61 0x887E0003, #65 0x887A0004, #47 various), and the first two are
+// self-explanatory once named: INVALID_REDIST means an Agility SDK folder the process is
+// pointed at is empty or mismatched, and UNSUPPORTED is what a debug-layer-enabled create
+// answers in a process that cannot support it.
+//
+// Deliberately not FormatMessage: the system message for these is either absent or a
+// generic "the parameter is incorrect", which is worse than the symbol name.
+// ---------------------------------------------------------------------------------------
+static const char *FeedHrName(long hr)
+{
+    switch (static_cast<unsigned long>(hr))
+    {
+    case 0x00000000ul: return "S_OK";
+    case 0x887E0001ul: return "D3D12_ERROR_ADAPTER_NOT_FOUND";
+    case 0x887E0002ul: return "D3D12_ERROR_DRIVER_VERSION_MISMATCH";
+    case 0x887E0003ul: return "D3D12_ERROR_INVALID_REDIST";
+    case 0x887A0001ul: return "DXGI_ERROR_INVALID_CALL";
+    case 0x887A0002ul: return "DXGI_ERROR_NOT_FOUND";
+    case 0x887A0004ul: return "DXGI_ERROR_UNSUPPORTED";
+    case 0x887A0005ul: return "DXGI_ERROR_DEVICE_REMOVED";
+    case 0x887A0006ul: return "DXGI_ERROR_DEVICE_HUNG";
+    case 0x887A0007ul: return "DXGI_ERROR_DEVICE_RESET";
+    case 0x887A0020ul: return "DXGI_ERROR_DRIVER_INTERNAL_ERROR";
+    case 0x887A0022ul: return "DXGI_ERROR_NOT_CURRENTLY_AVAILABLE";
+    case 0x887A002Dul: return "DXGI_ERROR_SDK_COMPONENT_MISSING";
+    case 0x80004001ul: return "E_NOTIMPL";
+    case 0x80004002ul: return "E_NOINTERFACE";
+    case 0x80004005ul: return "E_FAIL";
+    case 0x80070057ul: return "E_INVALIDARG";
+    case 0x8007000Eul: return "E_OUTOFMEMORY";
+    case 0x887A0003ul: return "DXGI_ERROR_MORE_DATA";
+    default:           return "?";
+    }
+}
+
+// ---------------------------------------------------------------------------------------
 // Who a DLL says it is.
 //
 // The version number alone does not identify an NGX runtime. NVIDIA's own nvngx_dlssnr.dll

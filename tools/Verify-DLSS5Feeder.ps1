@@ -1218,6 +1218,30 @@ if (-not $foundAny) {
 # 7. GPU
 # ---------------------------------------------------------------------------------------
 
+Write-Section 'Direct3D 12 runtime'
+
+# A game-local D3D12 folder is an Agility SDK redist path. If the game's exe exports
+# D3D12SDKVersion/D3D12SDKPath, every D3D12 device created in that process -- including the
+# feeder's private one -- loads D3D12Core.dll from there. An empty or incomplete folder then
+# fails D3D12CreateDevice with 0x887E0003 (D3D12_ERROR_INVALID_REDIST), which reads as a
+# feeder bug and is not one. Issue #61 arrived with exactly that code and an empty folder.
+$agilityDir = Join-Safe $gameDir 'D3D12'
+if (-not (Test-Path -LiteralPath $agilityDir -PathType Container)) {
+    Report -Status 'Ok' -Text 'No game-local D3D12\ (Agility SDK) folder; the system Direct3D 12 runtime is used.'
+}
+else {
+    $agilityFiles = @(Get-ChildItem -LiteralPath $agilityDir -File -ErrorAction SilentlyContinue)
+    $agilityCore  = @($agilityFiles | Where-Object { $_.Name -ieq 'D3D12Core.dll' })
+    if ($agilityCore.Count -gt 0) {
+        Report -Status 'Ok' -Text ('Game-local D3D12\ (Agility SDK) folder with D3D12Core.dll (' + $agilityFiles.Count + ' file(s)).')
+    }
+    else {
+        Report -Status 'Warn' -Text ('Game-local D3D12\ folder with ' + $agilityFiles.Count + ' file(s) and NO D3D12Core.dll.') `
+               -Detail 'If the game points Direct3D 12 at this folder, every device created in the process fails with 0x887E0003 (D3D12_ERROR_INVALID_REDIST) -- including the feeder private device, which then reports "D3D12CreateDevice failed".' `
+               -Action 'If the feeder log shows D3D12CreateDevice failed 0x887E0003, rename the game D3D12 folder and relaunch.'
+    }
+}
+
 Write-Section 'GPU'
 
 $gpus = $null

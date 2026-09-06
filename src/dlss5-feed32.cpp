@@ -321,13 +321,17 @@ struct Cfg
     int   cast_mode;       // how the panel is displayed: 0 = desktop-compositor thumbnail of the host window
                            // (windowed / borderless only), 1 = the host's shared panel texture drawn by the
                            // game's ReShade (IPC v7; works in exclusive fullscreen; all three client APIs)
+    int   cast_anchor;     // which corner of the game window the cast panel sits in: 0 top-left,
+                           // 1 top-right (the original, and still the default), 2 bottom-left,
+                           // 3 bottom-right. It was nailed to the top-right with no control at
+                           // all, which issue #44 reported as pinned and unmovable.
     int   host_creates;    // 0 = auto: this side creates the shared set and falls back to the host only when
                            // its device refuses one (a feature-level 10.x game, issue #33/#43). 1 = always
                            // let the host create it, which is the only way to exercise that path on a device
                            // that does not need it. Parse-only, not written back, not on the overlay.
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0, 0 };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 100, 0, 0.3f, 1, 1.0f, 1.0f, 0, 100, 0, 1, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -394,10 +398,11 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\n",
+               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
-            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode);
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
+            g_cfg.cast_anchor);
     fclose(f);
 }
 
@@ -407,7 +412,7 @@ static void CfgWriteDefault()
 static const char *const kCfgSavedKeys[] = {
     "enabled", "mode", "hdr", "depth_inverted", "flags", "reset_every", "log_frames",
     "host_window", "work_resolution", "work_upscale", "work_sharpness", "async_home",
-    "mv_scale_x", "mv_scale_y", "cast_key", "cast_scale", "cast_mode",
+    "mv_scale_x", "mv_scale_y", "cast_key", "cast_scale", "cast_mode", "cast_anchor",
 };
 
 static bool CfgKeyIsSaved(const char *key)
@@ -453,10 +458,11 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\n",
+               "host_window=%d\nwork_resolution=%d\nwork_upscale=%d\nwork_sharpness=%.2f\nasync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\ncast_key=%d\ncast_scale=%d\ncast_mode=%d\ncast_anchor=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
-            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode);
+            g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale, g_cfg.cast_mode,
+            g_cfg.cast_anchor);
     if (!carried.empty()) fputs(carried.c_str(), f);
     fclose(f);
 }
@@ -525,6 +531,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "cast_key")       == 0) next.cast_key       = (iv > 0 && iv < 256) ? iv : 0;
         else if (_stricmp(key, "cast_scale")     == 0) next.cast_scale     = iv < 25 ? 25 : iv > 300 ? 300 : iv;
         else if (_stricmp(key, "cast_mode")      == 0) next.cast_mode      = iv == 1 ? 1 : 0;
+        else if (_stricmp(key, "cast_anchor")    == 0) next.cast_anchor    = iv < 0 ? 0 : iv > 3 ? 3 : iv;
         else if (_stricmp(key, "host_creates")   == 0) next.host_creates   = iv == 1 ? 1 : 0;
     }
     fclose(f);
@@ -543,11 +550,11 @@ static bool CfgReload()   // true when a build-affecting value changed
         // what they had set (issue #15). The 64-bit side has always printed its full set.
         Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d log_frames=%d "
             "host_window=%d work_resolution=%d%% work_upscale=%d work_sharpness=%.2f async_home=%d "
-            "mv_scale=%.3f,%.3f cast_key=%d cast_scale=%d cast_mode=%d host_creates=%d",
+            "mv_scale=%.3f,%.3f cast_key=%d cast_scale=%d cast_mode=%d cast_anchor=%d host_creates=%d",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.work_upscale, g_cfg.work_sharpness,
             g_cfg.async_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.cast_key, g_cfg.cast_scale,
-            g_cfg.cast_mode, g_cfg.host_creates);
+            g_cfg.cast_mode, g_cfg.cast_anchor, g_cfg.host_creates);
     }
     return rebuild;
 }
@@ -1487,7 +1494,13 @@ static bool CastLayout()
     if (src.cx * s > gc.right) s = static_cast<float>(gc.right) / static_cast<float>(src.cx);
     s *= static_cast<float>(g_cfg.cast_scale) / 100.0f;   // the user's size, relative to the fit
     const int dw = static_cast<int>(src.cx * s + 0.5f), dh = static_cast<int>(src.cy * s + 0.5f);
-    const RECT dest = { gc.right - dw, 0, gc.right, dh };
+    // cast_anchor picks the corner. This was { gc.right - dw, 0, gc.right, dh } outright --
+    // the top-right and nothing else, which is fine until the game puts something there.
+    const bool  right  = g_cfg.cast_anchor == 1 || g_cfg.cast_anchor == 3;
+    const bool  bottom = g_cfg.cast_anchor >= 2;
+    const LONG  dx = right  ? gc.right  - dw : 0;
+    const LONG  dy = bottom ? gc.bottom - dh : 0;
+    const RECT dest = { dx, dy, dx + dw, dy + dh };
 
     if (texture)
     {
@@ -2207,10 +2220,17 @@ static bool HostLinkStop()
     // It is finished, so anything it half-opened is ours. Break the pipe first and give the
     // host the same few seconds HostClose does: a host that has just connected still has a
     // ReShade ini to save, and killing it outright loses the overlay layout.
+    // Only a host that got as far as opening the pipe has an ini worth saving. One still
+    // inside its NGX/ReShade startup has nothing to lose and will not exit on its own, so
+    // waiting the full grace on it just widens the window in which it and its replacement
+    // both want a pipe only one of them can own (issue #58).
+    const bool connected = g_link.pipe != nullptr;
     if (g_link.pipe != nullptr) { CloseHandle(g_link.pipe); g_link.pipe = nullptr; }
     if (g_link.proc != nullptr)
     {
-        if (WaitForSingleObject(g_link.proc, 4000) != WAIT_OBJECT_0) TerminateProcess(g_link.proc, 0);
+        const DWORD grace = connected ? 4000u : 0u;
+        if (!connected) Log("[feed32] the host had not connected yet; stopping it without the save grace");
+        if (WaitForSingleObject(g_link.proc, grace) != WAIT_OBJECT_0) TerminateProcess(g_link.proc, 0);
         CloseHandle(g_link.proc);
         g_link.proc = nullptr;
     }
@@ -2397,20 +2417,22 @@ static void HostIniPath(char *out)
         strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\ReShade.ini");
 }
 
-// The host's own window size (host/dlss5-feed-host64.cpp's FitWindowToWorkArea): a real
-// resize of its window, swapchain and the panel texture this add-on casts, not just the
-// scaled-picture "Panel size (%)" slider below. Same [DLSS5Host] keys the host itself
-// reads and writes defaults for, so editing here and editing the ini by hand are the same
-// thing. Takes effect the next time the host (re)starts -- it only sizes its window once,
-// at startup -- so this is a plain read/write on the file, no IPC round trip.
-static int  g_host_win_w = 620, g_host_win_h;   // 0 = auto (fill the work area), the host's own default
+// The host's own window size: a real resize of its window, swapchain and the panel texture
+// this add-on casts, not just the scaled-picture "Panel size (%)" slider below.
+//
+// Written to the same [DLSS5Host] keys the host reads at startup, so the choice survives a
+// restart AND editing the ini by hand still works -- and, since IPC v8, ALSO sent down the
+// pipe so it applies to the running host straight away. It used to be the ini alone, which
+// meant moving these sliders appeared to do nothing until the user found the "Restart the
+// DLSS 5 host" button further down the page (issue #44).
+static int  g_host_win_w = 900, g_host_win_h;   // 0 = auto (fill the work area), the host's own default
 static bool g_host_win_loaded;
 
 static void ReadHostWindowSize()
 {
     char p[MAX_PATH];
     HostIniPath(p);
-    g_host_win_w = GetPrivateProfileIntA("DLSS5Host", "WindowWidth", 620, p);
+    g_host_win_w = GetPrivateProfileIntA("DLSS5Host", "WindowWidth", 900, p);
     g_host_win_h = GetPrivateProfileIntA("DLSS5Host", "WindowHeight", 0, p);
 }
 
@@ -2489,12 +2511,25 @@ static void HostClose();   // below
 // fences, tears down shared state and stops the worker -- none of which may happen beside a
 // frame that is using them. So the buttons only record what they want; FeedFrame consumes
 // it at the top of the next frame, inside the lock.
-enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY };
+enum { HOST_REQ_NONE = 0, HOST_REQ_RESTART, HOST_REQ_APPLY, HOST_REQ_WINSIZE };
 static volatile LONG g_host_request;
 static char          g_host_request_why[160];
 
+// True while a host process has been spawned but has not finished its handshake. HostAlive()
+// is false for that whole window -- the process handle only reaches g.hproc when the connect
+// job completes -- so without this, nothing in the add-on can tell "no host" from "a host is
+// on its way", and the overlay offered to start a second one. Issue #58: the reporter's host
+// needs about 11 s to reach its first connection, and pressing the button in that gap killed
+// the starter and spawned a rival for a pipe only one of them can own.
+static bool HostStarting() { return g_link.state == LINK_RUNNING; }
+
 static void HostRequest(int req, const char *why)
 {
+    if (req == HOST_REQ_RESTART && HostStarting())
+    {
+        Warn("a host is already starting -- waiting for it rather than spawning a second one");
+        return;
+    }
     if (why != nullptr) strcpy_s(g_host_request_why, why);
     InterlockedExchange(&g_host_request, req);
     CaptureGameFocus();   // spent once the replacement host has connected
@@ -2532,6 +2567,46 @@ static void HostApplySettings()
     Warn("DLSS 5 settings applied -- the replacement host starts in the background");
 }
 
+// v8: resize the running host's window, without restarting it.
+//
+// The panel texture the cast draws is created by THIS side at FeedHelloAck::panel_* size and
+// handed over in the build, so a window resize makes it the wrong size. Rather than invent a
+// host-to-game notification for that, the size we just asked for is adopted here and the
+// build marked stale: the host applies the 'W' and the rebuild in pipe order, off the one
+// pipe, so the texture it receives is already the new size. CastPanelAvailable() covers the
+// frame or two in between with "waiting for the panel texture", which it already does after
+// every other rebuild.
+static void HostApplyWindowSize()
+{
+    if (g.pipe == nullptr) return;   // nothing running; the ini write is all that is needed
+
+    int want_h = g_host_win_h;
+    if (want_h == 0)
+    {
+        RECT wa = {}, deco = {};
+        if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) && wa.bottom > wa.top)
+        {
+            AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+            want_h = (wa.bottom - wa.top) - (deco.bottom - deco.top);
+        }
+    }
+    if (want_h < 300) want_h = 300; else if (want_h > 8000) want_h = 8000;
+    int want_w = g_host_win_w;
+    if (want_w < 300) want_w = 300; else if (want_w > 4000) want_w = 4000;
+    want_w &= ~1; want_h &= ~1;
+
+#pragma pack(push, 1)
+    struct { BYTE tag; FeedWindowMsg wm; } msg = { 'W', { static_cast<uint32_t>(want_w), static_cast<uint32_t>(want_h) } };
+#pragma pack(pop)
+    if (!PipeWrite(&msg, sizeof(msg))) { HostLost("the window resize could not be sent"); return; }
+
+    g.panel_w = static_cast<unsigned>(want_w);
+    g.panel_h = static_cast<unsigned>(want_h);
+    CastRelease();     // the cast is holding a texture of the old size
+    g.built = false;   // next frame rebuilds, handing over a panel texture at the new size
+    Log("[feed32] host window resized to %dx%d and the panel texture rebuilt to match", want_w, want_h);
+}
+
 static bool HostRequestPending() { return g_host_request != HOST_REQ_NONE; }
 
 // Called from OnPresent, on the render thread and inside the feed lock.
@@ -2540,6 +2615,7 @@ static void HostConsumeRequest()
     const LONG req = InterlockedExchange(&g_host_request, HOST_REQ_NONE);
     if (req == HOST_REQ_RESTART) HostRestart(g_host_request_why);
     else if (req == HOST_REQ_APPLY) HostApplySettings();
+    else if (req == HOST_REQ_WINSIZE) HostApplyWindowSize();
 }
 
 // ---------------------------------------------------------------------------
@@ -5219,6 +5295,13 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         ImGui::SameLine(); HelpMarker("A key that shows and hides the panel without opening this overlay. "
                                       "Saved as cast_key in dlss5-feed.cfg.");
     }
+    {
+        static const char *const kAnchors[] = { "Top-left", "Top-right", "Bottom-left", "Bottom-right" };
+        int anchor = g_cfg.cast_anchor < 0 || g_cfg.cast_anchor > 3 ? 1 : g_cfg.cast_anchor;
+        if (ImGui::Combo("Panel corner", &anchor, kAnchors, 4)) { g_cfg.cast_anchor = anchor; dirty = true; }
+        ImGui::SameLine(); HelpMarker("Which corner of the game window the cast panel sits in. It used to be "
+                                      "the top-right and only that. Saved as cast_anchor in dlss5-feed.cfg.");
+    }
     bool show_host_window = g_cfg.host_window != 0;
     if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
     ImGui::SameLine(); HelpMarker("The helper process's own separate window, the old way in. Not needed for the "
@@ -5226,17 +5309,21 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
 
     if (!g_host_win_loaded) { ReadHostWindowSize(); g_host_win_loaded = true; }
     bool win_size_touched = false;
-    if (ImGui::SliderInt("Host window width", &g_host_win_w, 300, 2000)) win_size_touched = true;
+    if (ImGui::SliderInt("Host window width", &g_host_win_w, 300, 4000)) win_size_touched = true;
     ImGui::SameLine(); HelpMarker("A REAL resize of the host window, its swapchain and the panel texture cast "
                                   "above -- ReShade's own tab column actually gets more room to lay out in, "
                                   "not just a bigger-drawn copy of the same pixels like \"Panel size (%)\" "
-                                  "below. Written straight into host64\\ReShade.ini's [DLSS5Host] section; "
-                                  "takes effect the next time the host (re)starts.");
-    if (ImGui::SliderInt("Host window height (0 = auto, full screen)", &g_host_win_h, 0, 3000)) win_size_touched = true;
+                                  "below. Applied to the running host as soon as you move the "
+                                  "slider, and saved to host64\\ReShade.ini's [DLSS5Host] section so it "
+                                  "survives a restart. You can also drag the host window's own border.");
+    if (ImGui::SliderInt("Host window height (0 = auto, full screen)", &g_host_win_h, 0, 8000)) win_size_touched = true;
     ImGui::SameLine(); HelpMarker("0 fills the primary monitor's work area (the default). This window is "
                                   "normally hidden behind the game, never shown on the desktop at OS size, so "
                                   "taller than the screen is fine if you want more room and less scrolling.");
     if (win_size_touched) WriteHostWindowSize();
+    // Applied to the RUNNING host too, not just saved for its next start. Deferred to the
+    // render thread: the pipe is written there, under the feed lock, and this is not.
+    if (win_size_touched) HostRequest(HOST_REQ_WINSIZE, nullptr);
 
     if (ImGui::CollapsingHeader("Advanced"))
     {
@@ -5351,11 +5438,21 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     // effect of "Apply to the DLSS 5 host".
     ImGui::Separator();
     ImGui::TextUnformatted("Host process");
-    if (ImGui::Button(HostAlive() ? "Restart the DLSS 5 host" : "Start the DLSS 5 host"))
+    // The label used to come from HostAlive() alone, which is false for the whole of a
+    // host's startup -- so during the very window in which pressing it does the most damage
+    // it read "Start the DLSS 5 host" and looked like the right thing to do (issue #58).
+    const bool starting = HostStarting();
+    ImGui::BeginDisabled(starting);
+    if (ImGui::Button(starting              ? "The DLSS 5 host is starting..."
+                      : HostAlive()         ? "Restart the DLSS 5 host"
+                                            : "Start the DLSS 5 host"))
         HostRequest(HOST_REQ_RESTART, HostAlive() ? "host restart requested from the overlay"
                                                   : "host start requested from the overlay");
+    ImGui::EndDisabled();
     ImGui::SameLine();
-    if (HostAlive())
+    if (starting)
+        ImGui::TextDisabled("(already on its way -- a second one cannot have the pipe)");
+    else if (HostAlive())
         ImGui::TextDisabled("(running -- the replacement starts in the background; only its shutdown pauses the game)");
     else
         ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),

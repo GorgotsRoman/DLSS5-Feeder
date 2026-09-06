@@ -59,7 +59,11 @@ static bool g_behind = false;
 // a modest fraction of its width -- a menu column down the right edge, not a large overlay
 // eating the middle of the screen. Set once in InitDisguise; the banner and the swapchain
 // both size themselves from it.
-static int  g_win_w = 620;
+// 620 was the first cut at "slim column" and it was too slim: ReShade's own tab column plus
+// the 96 px editor strip leaves under 500 px for the neural consumer's panel, whose sliders
+// and labels then wrap into an unusable stack (issue #44, "pretty unusable"). 900 keeps the
+// column shape while leaving the panel room to lay out.
+static int  g_win_w = 900;
 static int  g_win_h = 1080;
 
 // ReShade's overlay toggle key in the host's ReShade.ini ([INPUT] KeyOverlay, Home by
@@ -136,26 +140,30 @@ static void FitWindowToWorkArea(const char *ini)
 // Once ReShade's overlay is docked, its tabs (Home / Add-ons -- where the neural
 // consumer's panel is) sit in a 335 px column with the effect editor beside it. In this
 // window nobody edits shaders, so the tab column gets almost the whole width.
-static void PrepareHostOverlay()
+// Resolve the host's own ReShade.ini once; both the startup path and every later resize
+// need it.
+static void HostIniPath(char *out, size_t cb)
 {
-    char dir[MAX_PATH], ini[MAX_PATH];
+    char dir[MAX_PATH];
     GetModuleFileNameA(nullptr, dir, MAX_PATH);
     if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
-    sprintf_s(ini, "%sReShade.ini", dir);
+    sprintf_s(out, cb, "%sReShade.ini", dir);
+}
 
-    FitWindowToWorkArea(ini);
-
-    char buf[64] = {};
-    GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
-    const int k = atoi(buf);   // "36,0,0,0" -> 36; modifiers are ignored, ReShade's default has none
-    if (k > 0 && k < 256) g_overlay_key = static_cast<UINT>(k);
-
-    // Only the stock ReShade split (335 | 623 for a 960-wide window) is rewritten; a
-    // layout the user dragged into shape is left exactly as ReShade saved it.
+// force=false is the startup rule: adopt an empty or stock layout, resize one this host
+// wrote itself, and never touch one the user dragged into shape.
+//
+// force=true is what a deliberate resize needs. Declining to re-fit a user-arranged layout
+// is right when we are merely starting up beside it, and wrong when the user has just
+// dragged this window to a new size: the outer window and swapchain would change while
+// ReShade's own docked column stayed at its old absolute pixel width, which is the "expanding
+// it doesn't scale correctly" of issue #44.
+static void RefitHostOverlay(const char *ini, bool force)
+{
     char dock[4096] = {};
     GetPrivateProfileStringA("OVERLAY", "Docking", "", dock, sizeof(dock), ini);
     const int tabs_w = g_win_w - 96;
-    if (dock[0] == '\0')
+    if (dock[0] == '\0' || force)
     {
         char v[4096];
         sprintf_s(v, "[Docking][Data],DockSpace   ID=0xB0DF600F Window=0xCC18005E Pos=8,,8 Size=%d,,%d Split=X,  "
@@ -174,7 +182,8 @@ static void PrepareHostOverlay()
                   tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, tabs_w, g_win_h - 16,
                   tabs_w, g_win_h - 16, tabs_w, g_win_h - 16, g_win_w, g_win_h);
         WritePrivateProfileStringA("OVERLAY", "Window", v, ini);
-        Log("[host] ReShade.ini: wrote an overlay layout with the tab column %d px wide", tabs_w);
+        Log("[host] ReShade.ini: %s an overlay layout with the tab column %d px wide",
+            force ? "re-fitted" : "wrote", tabs_w);
     }
     else if (strstr(dock, "SizeRef=335,,540") != nullptr && strstr(dock, "SizeRef=623,,540") != nullptr)
     {
@@ -215,6 +224,21 @@ static void PrepareHostOverlay()
         }
         Log("[host] ReShade.ini: overlay layout is user-arranged; leaving it alone");
     }
+}
+
+static void PrepareHostOverlay()
+{
+    char ini[MAX_PATH];
+    HostIniPath(ini, sizeof(ini));
+
+    FitWindowToWorkArea(ini);
+
+    char buf[64] = {};
+    GetPrivateProfileStringA("INPUT", "KeyOverlay", "36", buf, sizeof(buf), ini);
+    const int k = atoi(buf);   // "36,0,0,0" -> 36; modifiers are ignored, ReShade's default has none
+    if (k > 0 && k < 256) g_overlay_key = static_cast<UINT>(k);
+
+    RefitHostOverlay(ini, false);
 }
 static bool g_renodx_present = false;   // renodx-dlss5.addon64 sits next to this exe
 // Its actual file name, which is not always the canonical one: a browser that downloaded the
@@ -999,9 +1023,28 @@ static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
 // and the DLSS 5 add-on arms itself, exactly as in a real D3D12 game.
 // ---------------------------------------------------------------------------
 
+static bool HostResize(int new_w, int new_h, const char *why);   // defined with the swapchain
+
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
     if (m == WM_CLOSE) { ShowWindow(w, SW_HIDE); return 0; }   // closing only hides; the feed lives on
+    // WS_OVERLAPPEDWINDOW has always let the user drag this window's border; until now
+    // nothing answered, so the swapchain kept its original size and DWM stretched it.
+    if (m == WM_GETMINMAXINFO)
+    {
+        RECT deco = {};
+        AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+        MINMAXINFO *mmi = reinterpret_cast<MINMAXINFO *>(lp);
+        mmi->ptMinTrackSize.x = 300 + (deco.right - deco.left);
+        mmi->ptMinTrackSize.y = 300 + (deco.bottom - deco.top);
+        return 0;
+    }
+    // SIZE_MINIMIZED arrives as 0x0, which is not a size anyone asked for.
+    if (m == WM_SIZE && wp != SIZE_MINIMIZED)
+    {
+        HostResize(LOWORD(lp), HIWORD(lp), "the window was resized");
+        return 0;
+    }
     return DefWindowProcW(w, m, wp, lp);
 }
 
@@ -1166,6 +1209,73 @@ static void InitBanner()
         Log("[host] panel copy ready: a D3D11 game may hand over a %dx%d texture to receive every presented frame", W, H);
     else
         Log("[host] panel copy unavailable; the game can only cast this window through the compositor");
+}
+
+// The single path for every size change after startup, whether it came from the user
+// dragging the window's border (WM_SIZE) or from the add-on's sliders over the pipe ('W').
+//
+// Until 0.14.0-beta.3 there was no such path at all: WndProc handled only WM_CLOSE, and
+// nothing in this file called ResizeBuffers. The window style has always been
+// WS_OVERLAPPEDWINDOW, so Windows let the user drag the border and then DWM stretched a
+// swapchain that was still its original size into the new client rect -- the picture
+// distorted instead of the UI getting more room, which is what issue #44 reported as "too
+// narrow and expanding it doesn't scale correctly". The [DLSS5Host] ini keys were the only
+// real resize, and they were read once, before the window existed.
+//
+// Returns true if anything actually changed.
+static bool HostResize(int new_w, int new_h, const char *why)
+{
+    if (new_w <= 0) new_w = g_win_w;
+    if (new_h <= 0) new_h = g_win_h;
+    if (new_w < 300) new_w = 300; else if (new_w > 4000) new_w = 4000;
+    if (new_h < 300) new_h = 300; else if (new_h > 8000) new_h = 8000;
+    new_w &= ~1; new_h &= ~1;
+    if (new_w == g_win_w && new_h == g_win_h) return false;
+    if (h.swap == nullptr) { g_win_w = new_w; g_win_h = new_h; return true; }   // before InitDisguise
+
+    Log("[host] resizing the window from %dx%d to %dx%d (%s)", g_win_w, g_win_h, new_w, new_h, why);
+
+    // Everything recorded against the old back buffers must have retired before
+    // ResizeBuffers, or it releases surfaces the GPU is still reading.
+    if (g_pump_fence != nullptr) WaitFenceValue(g_pump_fence, g_pump_val, 2000);
+    if (g_panel_fence != nullptr) WaitFenceValue(g_panel_fence, g_panel_val, 2000);
+
+    if (g_swap3 != nullptr) { g_swap3->Release(); g_swap3 = nullptr; }
+    const HRESULT hr = h.swap->ResizeBuffers(3, static_cast<UINT>(new_w), static_cast<UINT>(new_h),
+                                             DXGI_FORMAT_R8G8B8A8_UNORM,
+                                             DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
+    if (FAILED(hr))
+    {
+        Log("[host] ResizeBuffers failed 0x%08X (%s); keeping %dx%d", hr, FeedHrName(hr), g_win_w, g_win_h);
+        h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
+        return false;
+    }
+    h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
+
+    g_win_w = new_w;
+    g_win_h = new_h;
+
+    // The banner is drawn at window size, and the panel copy's command pair goes with it.
+    if (g_banner != nullptr) { g_banner->Release(); g_banner = nullptr; }
+    if (g_panel_list != nullptr) { g_panel_list->Release(); g_panel_list = nullptr; }
+    if (g_panel_alloc != nullptr) { g_panel_alloc->Release(); g_panel_alloc = nullptr; }
+    if (g_panel_fence != nullptr) { g_panel_fence->Release(); g_panel_fence = nullptr; }
+    g_panel_val = 0;
+    g_panel_ready = false;
+    InitBanner();
+
+    // The shared panel texture belongs to the game and is sized from FeedHelloAck, so it is
+    // now the wrong size. Drop ours; the add-on forces a rebuild alongside the resize
+    // request and hands over a new one at the new size.
+    if (h.panel != nullptr && !h.panel_host_owned) { h.panel->Release(); h.panel = nullptr; }
+
+    char ini[MAX_PATH];
+    HostIniPath(ini, sizeof(ini));
+    RefitHostOverlay(ini, true);   // a deliberate resize re-fits even a user-arranged layout
+    char buf[16];
+    sprintf_s(buf, "%d", g_win_w); WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, ini);
+    sprintf_s(buf, "%d", g_win_h); WritePrivateProfileStringA("DLSS5Host", "WindowHeight", buf, ini);
+    return true;
 }
 
 // After Present: copy the buffer that was just presented -- banner plus whatever ReShade
@@ -1422,7 +1532,7 @@ static bool InitDisguise()
 
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
-    if (FAILED(hr)) { Log("[host] D3D12CreateDevice failed 0x%08X", hr); return false; }
+    if (FAILED(hr)) { Log("[host] D3D12CreateDevice failed 0x%08X (%s)", hr, FeedHrName(hr)); return false; }
 
     D3D12_COMMAND_QUEUE_DESC qd = {};
     h.dev->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&h.pump_queue));
@@ -2490,6 +2600,32 @@ static int Serve(DWORD game_pid)
             back.panel_size = game_panel != 0 ? h.panel_size : 0;
             WriteFull(pipe, &back, sizeof(back));
             if (!ok && DeviceRemoved("a rebuild")) break;   // the ack went out; retrying here is pointless
+        }
+        else if (tag == 'W')
+        {
+            // v8: the add-on's window sliders, applied live. Handled here rather than by
+            // posting to the window thread so it is ordered against the rebuild the add-on
+            // sends straight afterwards -- the panel texture it hands over must be the new
+            // size, and both arrive down this one pipe in order.
+            FeedWindowMsg wm = {};
+            if (!ReadFull(pipe, &wm, sizeof(wm))) break;
+            int want_h = static_cast<int>(wm.height);
+            if (want_h == 0)   // 0 = auto: fill the work area, same rule as the ini key
+            {
+                RECT wa = {}, deco = {};
+                if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0) && wa.bottom > wa.top)
+                {
+                    AdjustWindowRect(&deco, WS_OVERLAPPEDWINDOW, FALSE);
+                    want_h = (wa.bottom - wa.top) - (deco.bottom - deco.top);
+                }
+            }
+            if (HostResize(static_cast<int>(wm.width), want_h, "the game asked") && h.hwnd != nullptr)
+            {
+                RECT frame = { 0, 0, g_win_w, g_win_h };
+                AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+                SetWindowPos(h.hwnd, nullptr, 0, 0, frame.right - frame.left, frame.bottom - frame.top,
+                             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
         }
         else if (tag == 'F')
         {

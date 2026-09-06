@@ -3408,6 +3408,132 @@ static void FeedEnableDred()
     Log("[feed] DRED: auto-breadcrumbs and page-fault reporting enabled");
 }
 
+typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
+
+// The other half of FeedEnableDred. Arming DRED is the one thing this add-on does before
+// D3D12CreateDevice that the host64 helper -- which creates its device successfully on the
+// very machines where the add-on's create fails -- does not do at all. That asymmetry is
+// only testable if the arming can be undone, so: FORCED_OFF, then create again.
+static void FeedDisableDred()
+{
+    HMODULE d3d12 = GetModuleHandleW(L"d3d12.dll");
+    if (d3d12 == nullptr) return;
+    auto get_debug = reinterpret_cast<PFN_D3D12GetDebugInterface_>(GetProcAddress(d3d12, "D3D12GetDebugInterface"));
+    if (get_debug == nullptr) return;
+
+    ID3D12DeviceRemovedExtendedDataSettings *dred = nullptr;
+    if (FAILED(get_debug(__uuidof(ID3D12DeviceRemovedExtendedDataSettings),
+                         reinterpret_cast<void **>(&dred))) || dred == nullptr) return;
+    dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
+    dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_OFF);
+    dred->Release();
+}
+
+// A game-local D3D12\ folder is an Agility SDK redist path. If the game's exe exports
+// D3D12SDKVersion/D3D12SDKPath, EVERY device created in the process -- ours included --
+// loads D3D12Core.dll from there, so an empty or mismatched folder fails our create with
+// D3D12_ERROR_INVALID_REDIST even though we never asked for it. Issue #61 arrived with
+// exactly that code and an empty D3D12\ folder, and nothing here knew to look.
+static void FeedLogAgilityFolder()
+{
+    wchar_t dir[MAX_PATH] = {};
+    if (GetModuleFileNameW(nullptr, dir, MAX_PATH) == 0) return;
+    if (wchar_t *s = wcsrchr(dir, L'\\')) *(s + 1) = L'\0';
+
+    wchar_t probe[MAX_PATH] = {};
+    swprintf_s(probe, L"%sD3D12", dir);
+    const DWORD attr = GetFileAttributesW(probe);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) return;
+
+    swprintf_s(probe, L"%sD3D12\\*", dir);
+    WIN32_FIND_DATAW fd = {};
+    HANDLE h = FindFirstFileW(probe, &fd);
+    int files = 0;
+    bool core = false;
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+            ++files;
+            if (_wcsicmp(fd.cFileName, L"D3D12Core.dll") == 0) core = true;
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    if (core)
+        Log("[feed] the game folder has a D3D12\\ (Agility SDK) folder with D3D12Core.dll and %d file(s).", files);
+    else
+        Log("[feed] the game folder has a D3D12\\ (Agility SDK) folder with %d file(s) and NO D3D12Core.dll. "
+            "If the game points D3D12 at it, every device in this process fails to create -- try renaming "
+            "that folder.", files);
+}
+
+// Which adapter DXGI is about to hand us, said BEFORE the device exists.
+//
+// LogAdapterIdentity can only run afterwards -- it starts from the device's own LUID -- so
+// until now a failed create reported nothing whatsoever about the adapter it tried, on the
+// two openers that pass a null adapter and let DXGI choose. That is precisely the gap issue
+// #47 keeps falling into: the helper takes DXGI's default and the add-on takes the game's,
+// and on a hybrid or multi-adapter machine nothing in either log said so.
+static void FeedLogDefaultAdapter()
+{
+    typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
+    HMODULE dxgi = GetModuleHandleW(L"dxgi.dll");
+    if (dxgi == nullptr) dxgi = LoadLibraryW(L"dxgi.dll");
+    auto make_factory = dxgi != nullptr
+        ? reinterpret_cast<PFN_CreateDXGIFactory1_>(GetProcAddress(dxgi, "CreateDXGIFactory1")) : nullptr;
+    if (make_factory == nullptr) return;
+
+    IDXGIFactory1 *f = nullptr;
+    if (FAILED(make_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&f))) || f == nullptr) return;
+
+    IDXGIAdapter1 *a = nullptr;
+    if (f->EnumAdapters1(0, &a) != DXGI_ERROR_NOT_FOUND && a != nullptr)
+    {
+        DXGI_ADAPTER_DESC1 ad = {};
+        a->GetDesc1(&ad);
+        Log("[feed] about to create the private device on DXGI's default adapter: %ls  "
+            "LUID %08lX:%08lX  PCI %04X:%04X", ad.Description,
+            (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart,
+            ad.VendorId, ad.DeviceId);
+        a->Release();
+    }
+    f->Release();
+}
+
+// One place where a private D3D12 device is made, for all three session openers. It says
+// which adapter it is about to use BEFORE the call (a failed create used to report nothing
+// at all about the adapter, which is the hole issue #47 kept falling into), names the
+// HRESULT, and retries once with DRED disarmed.
+static HRESULT FeedCreatePrivateDevice(PFN_D3D12CreateDevice_ create_device, IUnknown *adapter,
+                                       ID3D12Device **out)
+{
+    HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                               reinterpret_cast<void **>(out));
+    if (SUCCEEDED(hr) && *out != nullptr) return hr;
+
+    Log("[feed] D3D12CreateDevice failed 0x%08X (%s)", hr, FeedHrName(hr));
+    if (static_cast<unsigned long>(hr) == 0x887E0003ul) FeedLogAgilityFolder();
+    if (g_debug_layer_on)
+        Log("[feed] the D3D12 debug layer is on in this process, and enabling it is known to make "
+            "D3D12CreateDevice itself fail here. It cannot be turned off again once enabled, so if "
+            "the retry below also fails, clear DLSS5_FEED_D3D12_DEBUG and restart the game.");
+
+    // DRED is the only thing we arm that the helper does not.
+    FeedDisableDred();
+    *out = nullptr;
+    hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
+                       reinterpret_cast<void **>(out));
+    if (SUCCEEDED(hr) && *out != nullptr)
+    {
+        Log("[feed] D3D12CreateDevice succeeded on a retry with DRED disarmed. Breadcrumbs are "
+            "unavailable for this session; a device removal will have no trail.");
+        return hr;
+    }
+    Log("[feed] the retry without DRED also failed 0x%08X (%s)", hr, FeedHrName(hr));
+    return hr;
+}
+
 static const char *FeedDredOpName(D3D12_AUTO_BREADCRUMB_OP op)
 {
     switch (op)
@@ -3541,8 +3667,6 @@ static void FeedDumpDred(HRESULT removed_reason)
     Log("[feed] ===== DRED end =====");
 }
 
-typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
-
 static void ShutdownSession();   // defined below; every InitSession* unwinds through it
 
 static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
@@ -3563,7 +3687,18 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     {
         DXGI_ADAPTER_DESC ad = {};
         adapter->GetDesc(&ad);
-        Log("[feed] adapter: %ls  vram=%llu MB", ad.Description, (unsigned long long)(ad.DedicatedVideoMemory >> 20));
+        // The LUID matters as much as the name: this opener passes the GAME's adapter, while
+        // the Vulkan/OpenGL openers and the host64 helper all pass null and take DXGI's
+        // default. On a hybrid or multi-adapter machine those can differ, and issue #47 has
+        // no way to see that unless both sides print the LUID (see FeedLogDefaultAdapter).
+        Log("[feed] adapter: %ls  LUID %08lX:%08lX  vram=%llu MB", ad.Description,
+            (unsigned long)ad.AdapterLuid.HighPart, (unsigned long)ad.AdapterLuid.LowPart,
+            (unsigned long long)(ad.DedicatedVideoMemory >> 20));
+    }
+    else
+    {
+        Log("[feed] the game's D3D11 device named no adapter; falling back to DXGI's default");
+        FeedLogDefaultAdapter();
     }
 
     // Loaded here, not imported: ReShade installs its D3D12 hooks when the library arrives,
@@ -3582,8 +3717,8 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     FeedEnableDred();
 
     {
-        HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
-        if (FAILED(hr) || g.dev12 == nullptr) { Log("[feed] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
+        HRESULT hr = FeedCreatePrivateDevice(create_device, adapter, &g.dev12);
+        if (FAILED(hr) || g.dev12 == nullptr) goto fail;
         g.dev12_owned = true;
     // Debug names make the DRED breadcrumb and page-fault output identify OUR objects.
     g.dev12->SetName(L"dlss5-feed private device");
@@ -3962,10 +4097,10 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     }
     FeedEnableD3D12DebugLayer();   // must precede device creation
     FeedEnableDred();              // must precede device creation
-    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
+    FeedLogDefaultAdapter();
+    HRESULT hr = FeedCreatePrivateDevice(create_device, nullptr, &g.dev12);
     if (FAILED(hr) || g.dev12 == nullptr)
     {
-        Log("[feed] D3D12CreateDevice failed 0x%08X", hr);
         FeedDisable("the private D3D12 device failed");
         return false;
     }
@@ -4349,10 +4484,10 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     }
     FeedEnableD3D12DebugLayer();   // must precede device creation
     FeedEnableDred();              // must precede device creation
-    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
+    FeedLogDefaultAdapter();
+    HRESULT hr = FeedCreatePrivateDevice(create_device, nullptr, &g.dev12);
     if (FAILED(hr) || g.dev12 == nullptr)
     {
-        Log("[feed] D3D12CreateDevice failed 0x%08X", hr);
         FeedDisable("the private D3D12 device failed");
         return false;
     }
@@ -6740,6 +6875,13 @@ static void OnDestroyDevice(reshade::api::device *dev)
     {
         Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
         g_ngx_dying = true;
+        // The present-order hook is on THIS device's dispatch entry, so it must come out
+        // with the device. A game that destroys its device and makes another without
+        // destroying the instance never unloads this add-on, so DllMain -- the only other
+        // place that removes it -- would not run: the jmp would be left pointing into a
+        // dispatch table the driver is free to reuse. Same discipline feed_vk_hook.h
+        // already documents for the vkCreateDevice hook.
+        FeedVkFramePresentRemove();
         // ReShade destroys its queue wrappers BEFORE emitting destroy_device.
         // Vulkan requires the application to have retired work before this point.
         g.rs_queue = nullptr;

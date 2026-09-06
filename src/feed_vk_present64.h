@@ -27,6 +27,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkFramePresent(VkQueue queue, const Vk
     return g_vk_frame_present_orig(queue, info);
 }
 
+static void FeedVkFramePresentRemove();
+
 static bool FeedVkFramePresentInstall(reshade::api::effect_runtime *rt)
 {
     if (rt->get_device()->get_api() != reshade::api::device_api::vulkan) return true;
@@ -34,7 +36,11 @@ static bool FeedVkFramePresentInstall(reshade::api::effect_runtime *rt)
     const auto gdpa = loader ? reinterpret_cast<PFN_vkGetDeviceProcAddr>(GetProcAddress(loader, "vkGetDeviceProcAddr")) : nullptr;
     void *target = gdpa ? reinterpret_cast<void *>(gdpa(FeedVkDispatch<VkDevice>(rt->get_device()->get_native()), "vkQueuePresentKHR")) : nullptr;
     if (!target) return false;
-    if (g_vk_frame_present_target) return target == g_vk_frame_present_target;
+    if (g_vk_frame_present_target == target) return true;
+    // A different dispatch entry than the one we hold means a new device (or a changed
+    // layer chain) -- re-hook rather than reporting failure and leaving the old device's
+    // entry hooked, which is what returning false here used to do.
+    if (g_vk_frame_present_target) FeedVkFramePresentRemove();
     // The device dispatch entry includes ReShade and catches engines bypassing
     // the loader export used by the old, counting-only present hook.
     MH_STATUS status = MH_Initialize();

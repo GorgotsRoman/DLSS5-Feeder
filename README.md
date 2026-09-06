@@ -587,9 +587,16 @@ work. Two folders to fill:
   - **Show as texture** draws it through the game's own ReShade instead and also works in exclusive
     fullscreen; it appears once the feed has built.
   - While the panel is up the mouse and keyboard belong to it. Escape away from it hides it, Alt+F4
-    hides it and closes the game, and the X in its corner always closes it. **Panel size** scales it.
+    hides it and closes the game, and the X in its corner always closes it. **Panel size** scales it,
+    and **Panel corner** moves it to any of the four corners of the game window.
 - `host_window=1` in `dlss5-feed.cfg` gives the helper a visible window of its own instead (Home opens
   the panel there).
+- **Host window width / height** on the overlay resize the helper's window for real -- its window,
+  its swapchain and the panel texture cast into the game, so ReShade's own tab column gets more
+  room rather than the same pixels drawn bigger. From 0.14.0-beta.3 this applies **immediately**,
+  with no host restart, and you can equally just drag the helper window's border. The values are
+  saved as `WindowWidth` / `WindowHeight` under `[DLSS5Host]` in `host64\ReShade.ini` (a different
+  file from `dlss5-feed.cfg`, because it is the helper's own ReShade that reads them at startup).
 
 ![32-bit-overlay-ingame](Ingame-32bit-overlay.png)
 
@@ -1054,6 +1061,13 @@ if you prefer editing the file directly:
 | `cast_key` | 0 | **32-bit games only.** Virtual-key code that shows/hides the cast DLSS 5 panel in-game; 0 = none. Set it from the overlay page with "Set key" rather than by hand. |
 | `cast_scale` | 100 | **32-bit games only.** Size of the cast panel, 25..300 % of the largest size that fits the game window (above 100 % it may run past the window's edges). Also on the overlay as "Panel size". |
 | `cast_mode` | 0 | **32-bit games only.** How the cast panel is drawn: 0 = a desktop-compositor thumbnail of the helper's window (windowed / borderless games, any API); 1 = a shared copy of the helper's frame drawn by the game's ReShade or blitted onto its backbuffer (works in exclusive fullscreen; D3D11, OpenGL and Vulkan). The two overlay buttons set it. |
+| `cast_anchor` | 1 | **32-bit games only.** Which corner of the game window the cast panel sits in: 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right. Before 0.14.0-beta.3 it was always the top-right and there was no way to move it. Also on the overlay as "Panel corner". |
+
+Two more live in a **different file** -- `[DLSS5Host] WindowWidth` and `WindowHeight` in
+`host64\ReShade.ini`, because the helper's own ReShade reads them when it starts. They size the
+helper window, its swapchain and the cast panel texture; `WindowHeight=0` means "fill the work area".
+The overlay's **Host window width / height** sliders write them and apply them to the running helper
+at once, so there is normally no reason to edit them by hand.
 
 In `DLSS5_Feed.fx`'s own UI (settings that only make sense per-shader, not per-session):
 

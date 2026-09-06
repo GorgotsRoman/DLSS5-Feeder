@@ -70,7 +70,7 @@
 #include <cstdint>
 
 #define FEED_IPC_MAGIC   0x35534C44u  // 'DLS5'
-#define FEED_IPC_VERSION 7u
+#define FEED_IPC_VERSION 8u
 
 // FeedBuild::client_flags (v5+)
 #define FEED_BUILD_HOST_CREATES  1u   // tex[] are zero: the host creates the shared set and answers with handles
@@ -181,6 +181,11 @@ struct FeedBuildAck     // host -> game
                                  // process of the HOST-created panel texture (they cannot export one for the
                                  // host to open); 0 = none. RGBA8, FeedHelloAck::panel_* in size.
     uint64_t panel_size;         // v7+: its GetResourceAllocationInfo size, for the GL import
+};
+
+struct FeedWindowMsg    // game -> host ('W'), v8+: resize the host window, live
+{
+    uint32_t width, height;   // client-area pixels; height 0 = auto (fill the work area)
 };
 
 struct FeedFrameMsg     // game -> host, per frame
