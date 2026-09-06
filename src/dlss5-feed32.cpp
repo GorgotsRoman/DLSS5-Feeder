@@ -58,7 +58,7 @@
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
-#define FEED_VERSION "0.14.0-beta.3"
+#define FEED_VERSION "0.14.0-beta.4"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -1207,6 +1207,26 @@ static void CastReleasePanel()
     g.panel_w = g.panel_h = 0;
 }
 
+// A resize on either side makes every view of the panel the wrong size. CastMakePanel
+// returns its cached handle whenever it has one, and the GL / Vulkan importers likewise
+// keep what they imported -- so a plain g.built = false after a resize handed the host
+// the OLD 900x1992 texture again, the host refused it ("not 1290x1660 RGBA8; ignoring
+// it"), CopyPanel never ran, and the cast drew that frozen texture into a rect sized
+// for the new one. That is the "it just stretches" of the first beta.3 test in Fable.
+//
+// Drop the D3D11 texture here; the GL / Vulkan imports are host-created per build and
+// go with ReleaseShared on the rebuild this forces, and the host recreates its own at
+// the new size. Then adopt the size so the next CastMakePanel makes one that matches.
+static ULONGLONG g_panel_poll_quiet_until;   // CastLayout leaves the window size alone until then
+static void CastAdoptPanelSize(unsigned w, unsigned h, const char *why)
+{
+    CastReleasePanel();
+    g.panel_w = w;
+    g.panel_h = h;
+    g.built   = false;
+    Log("[feed32] cast: panel dropped and %ux%u adopted (%s); the next build hands the host one that matches", w, h, why);
+}
+
 // Returns the handle value to put in FeedBuild::panel_tex (0 = none).
 static uint64_t CastMakePanel()
 {
@@ -1448,6 +1468,26 @@ static bool CastLayout()
         g_cast_hwnd = CastFindHostWindow();
         if (g_cast_hwnd == nullptr) { strcpy_s(g_cast_status, "waiting for the host window"); return false; }
         Log("[feed32] cast: host window %p found", (void *)g_cast_hwnd);
+    }
+    // The host resizes itself when its border is dragged, and nothing announces that to
+    // this side: its window is the announcement. Adopt a size the panel disagrees with once
+    // it has held still for a moment, same even-alignment as the host applies to its
+    // swapchain. Quiet after the sliders send a size, since the window lags the request.
+    if (g.panel_w != 0 && GetTickCount64() >= g_panel_poll_quiet_until)
+    {
+        static ULONGLONG mismatch_since;
+        RECT wc = {};
+        if (GetClientRect(g_cast_hwnd, &wc) && wc.right >= 300 && wc.bottom >= 300 && !IsIconic(g_cast_hwnd))
+        {
+            const unsigned ww = static_cast<unsigned>(wc.right) & ~1u, wh = static_cast<unsigned>(wc.bottom) & ~1u;
+            if (ww == g.panel_w && wh == g.panel_h) mismatch_since = 0;
+            else if (mismatch_since == 0) mismatch_since = GetTickCount64();
+            else if (GetTickCount64() - mismatch_since > 400)
+            {
+                mismatch_since = 0;
+                CastAdoptPanelSize(ww, wh, "the host window was resized");
+            }
+        }
     }
     if (!g_cast_placed)
     {
@@ -2600,11 +2640,11 @@ static void HostApplyWindowSize()
 #pragma pack(pop)
     if (!PipeWrite(&msg, sizeof(msg))) { HostLost("the window resize could not be sent"); return; }
 
-    g.panel_w = static_cast<unsigned>(want_w);
-    g.panel_h = static_cast<unsigned>(want_h);
-    CastRelease();     // the cast is holding a texture of the old size
-    g.built = false;   // next frame rebuilds, handing over a panel texture at the new size
-    Log("[feed32] host window resized to %dx%d and the panel texture rebuilt to match", want_w, want_h);
+    CastRelease();   // the thumbnail registration; it is re-made against the resized window
+    CastAdoptPanelSize(static_cast<unsigned>(want_w), static_cast<unsigned>(want_h), "the sliders");
+    // The host has not resized yet, so for a moment its window still reads the old size;
+    // CastLayout's poll must not "correct" the size we just asked for back to that.
+    g_panel_poll_quiet_until = GetTickCount64() + 2500;
 }
 
 static bool HostRequestPending() { return g_host_request != HOST_REQ_NONE; }
@@ -5308,8 +5348,9 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "in-game panel above. Takes effect when the host is next started.");
 
     if (!g_host_win_loaded) { ReadHostWindowSize(); g_host_win_loaded = true; }
-    bool win_size_touched = false;
+    bool win_size_touched = false, win_size_released = false;
     if (ImGui::SliderInt("Host window width", &g_host_win_w, 300, 4000)) win_size_touched = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) win_size_released = true;
     ImGui::SameLine(); HelpMarker("A REAL resize of the host window, its swapchain and the panel texture cast "
                                   "above -- ReShade's own tab column actually gets more room to lay out in, "
                                   "not just a bigger-drawn copy of the same pixels like \"Panel size (%)\" "
@@ -5317,13 +5358,17 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
                                   "slider, and saved to host64\\ReShade.ini's [DLSS5Host] section so it "
                                   "survives a restart. You can also drag the host window's own border.");
     if (ImGui::SliderInt("Host window height (0 = auto, full screen)", &g_host_win_h, 0, 8000)) win_size_touched = true;
+    if (ImGui::IsItemDeactivatedAfterEdit()) win_size_released = true;
     ImGui::SameLine(); HelpMarker("0 fills the primary monitor's work area (the default). This window is "
                                   "normally hidden behind the game, never shown on the desktop at OS size, so "
                                   "taller than the screen is fine if you want more room and less scrolling.");
     if (win_size_touched) WriteHostWindowSize();
-    // Applied to the RUNNING host too, not just saved for its next start. Deferred to the
-    // render thread: the pipe is written there, under the feed lock, and this is not.
-    if (win_size_touched) HostRequest(HOST_REQ_WINSIZE, nullptr);
+    // Applied to the RUNNING host too, not just saved for its next start -- but on RELEASE,
+    // not per tick: every value the slider passes through is a full swapchain resize and a
+    // ReShade runtime recreate on the host, and the first Fable test queued twenty of them
+    // from one drag. Deferred to the render thread: the pipe is written there, under the
+    // feed lock, and this callback is not.
+    if (win_size_released) HostRequest(HOST_REQ_WINSIZE, nullptr);
 
     if (ImGui::CollapsingHeader("Advanced"))
     {

@@ -1024,6 +1024,8 @@ static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
 // ---------------------------------------------------------------------------
 
 static bool HostResize(int new_w, int new_h, const char *why);   // defined with the swapchain
+static bool g_sizing;                    // inside a border drag: WM_SIZE is coalesced until it ends
+static int  g_sizing_w, g_sizing_h;
 
 static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
 {
@@ -1039,10 +1041,20 @@ static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
         mmi->ptMinTrackSize.y = 300 + (deco.bottom - deco.top);
         return 0;
     }
+    // A border drag delivers WM_SIZE on every mouse move, and each one would be a swapchain
+    // resize plus a ReShade runtime recreate. Hold them until the drag ends.
+    if (m == WM_ENTERSIZEMOVE) { g_sizing = true; g_sizing_w = g_sizing_h = 0; return 0; }
+    if (m == WM_EXITSIZEMOVE)
+    {
+        g_sizing = false;
+        if (g_sizing_w > 0 && g_sizing_h > 0) HostResize(g_sizing_w, g_sizing_h, "the window was resized");
+        return 0;
+    }
     // SIZE_MINIMIZED arrives as 0x0, which is not a size anyone asked for.
     if (m == WM_SIZE && wp != SIZE_MINIMIZED)
     {
-        HostResize(LOWORD(lp), HIWORD(lp), "the window was resized");
+        if (g_sizing) { g_sizing_w = LOWORD(lp); g_sizing_h = HIWORD(lp); }
+        else HostResize(LOWORD(lp), HIWORD(lp), "the window was resized");
         return 0;
     }
     return DefWindowProcW(w, m, wp, lp);
@@ -1236,9 +1248,31 @@ static bool HostResize(int new_w, int new_h, const char *why)
     Log("[host] resizing the window from %dx%d to %dx%d (%s)", g_win_w, g_win_h, new_w, new_h, why);
 
     // Everything recorded against the old back buffers must have retired before
-    // ResizeBuffers, or it releases surfaces the GPU is still reading.
-    if (g_pump_fence != nullptr) WaitFenceValue(g_pump_fence, g_pump_val, 2000);
-    if (g_panel_fence != nullptr) WaitFenceValue(g_panel_fence, g_panel_val, 2000);
+    // ResizeBuffers, or it releases surfaces the GPU is still reading. This wait was
+    // 2000 ms, and in Fable it cost exactly 2000 ms on EVERY resize: the window is parked
+    // behind the game, DWM is not compositing it, and the pump queue sits inside DXGI's
+    // present-wait -- the copy finished long ago; only the fence SIGNAL is queued behind a
+    // present nobody will consume. ResizeBuffers discards those presents, which is the
+    // thing that unblocks it. So: long enough for a copy that is genuinely in flight, then
+    // go, and say so.
+    const ULONGLONG t0 = GetTickCount64();
+    bool retired = true;
+    if (g_pump_fence  != nullptr && !WaitFenceValue(g_pump_fence,  g_pump_val,  150)) retired = false;
+    if (g_panel_fence != nullptr && !WaitFenceValue(g_panel_fence, g_panel_val, 150)) retired = false;
+    if (!retired)
+        Log("[host] resize: the pump queue had not retired after %llu ms (the window is not being composited); resizing anyway",
+            static_cast<unsigned long long>(GetTickCount64() - t0));
+
+    // ReShade re-reads its ini inside ResizeBuffers (Destroyed -> Recreated runtime), so the
+    // re-fitted dock layout has to be on disk BEFORE the call, or the recreated runtime
+    // loads the layout for the old size and this write lands twenty milliseconds too late
+    // -- which is exactly what the first beta.3 log shows.
+    const int old_w = g_win_w, old_h = g_win_h;
+    g_win_w = new_w;
+    g_win_h = new_h;
+    char ini[MAX_PATH];
+    HostIniPath(ini, sizeof(ini));
+    RefitHostOverlay(ini, true);   // a deliberate resize re-fits even a user-arranged layout
 
     if (g_swap3 != nullptr) { g_swap3->Release(); g_swap3 = nullptr; }
     const HRESULT hr = h.swap->ResizeBuffers(3, static_cast<UINT>(new_w), static_cast<UINT>(new_h),
@@ -1246,14 +1280,14 @@ static bool HostResize(int new_w, int new_h, const char *why)
                                              DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT);
     if (FAILED(hr))
     {
-        Log("[host] ResizeBuffers failed 0x%08X (%s); keeping %dx%d", hr, FeedHrName(hr), g_win_w, g_win_h);
+        Log("[host] ResizeBuffers failed 0x%08X (%s); keeping %dx%d", hr, FeedHrName(hr), old_w, old_h);
+        g_win_w = old_w;
+        g_win_h = old_h;
+        RefitHostOverlay(ini, true);
         h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
         return false;
     }
     h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
-
-    g_win_w = new_w;
-    g_win_h = new_h;
 
     // The banner is drawn at window size, and the panel copy's command pair goes with it.
     if (g_banner != nullptr) { g_banner->Release(); g_banner = nullptr; }
@@ -1264,14 +1298,14 @@ static bool HostResize(int new_w, int new_h, const char *why)
     g_panel_ready = false;
     InitBanner();
 
-    // The shared panel texture belongs to the game and is sized from FeedHelloAck, so it is
-    // now the wrong size. Drop ours; the add-on forces a rebuild alongside the resize
-    // request and hands over a new one at the new size.
-    if (h.panel != nullptr && !h.panel_host_owned) { h.panel->Release(); h.panel = nullptr; }
+    // The shared panel texture is the wrong size now, whichever side created it. A D3D11
+    // game hands a new one over on the rebuild the add-on forces; for a GL / Vulkan game
+    // this side makes a new one on that same rebuild, so its old one goes here too.
+    if (h.panel != nullptr) { h.panel->Release(); h.panel = nullptr; }
+    if (h.panel_local != nullptr) { CloseHandle(h.panel_local); h.panel_local = nullptr; }
+    h.panel_host_owned = false;
+    h.panel_size = 0;
 
-    char ini[MAX_PATH];
-    HostIniPath(ini, sizeof(ini));
-    RefitHostOverlay(ini, true);   // a deliberate resize re-fits even a user-arranged layout
     char buf[16];
     sprintf_s(buf, "%d", g_win_w); WritePrivateProfileStringA("DLSS5Host", "WindowWidth", buf, ini);
     sprintf_s(buf, "%d", g_win_h); WritePrivateProfileStringA("DLSS5Host", "WindowHeight", buf, ini);
