@@ -290,16 +290,31 @@ follow step 6 above for the DLSS5-Feeder side. Also point them at `host64\`'s "3
 Feeder" window (Home key in it) — the DLSS 5 add-on's full panel lives there, not in the
 game's own overlay.
 
-**Host window size** (since 2026-09-04): the host window defaults to tall and narrow — full
-work-area height, 620 px wide — so the cast panel sits as a slim column down the right edge
-of the game rather than a wide overlay. Override it in `host64\ReShade.ini`'s `[DLSS5Host]`
-section (`WindowWidth` / `WindowHeight`, pixels; `WindowHeight=0` means auto/full height —
-both keys are written with their in-use values on first run, so they're there to edit even
-if you never read this). This is a real resize of the window/swapchain/panel texture, so
-ReShade's own UI gets more layout room, not just a bigger-drawn copy of the same pixels —
-unlike the cast panel's own in-game "Panel size (%)" slider, which only scales the picture.
-`WindowHeight` can exceed the monitor's height on purpose: the window is normally hidden
-behind the game, never composited on screen at OS size.
+**Host window size** (rewritten 2026-09-06, 0.14.0-beta.3): the host window is now genuinely
+resizable, live. Three ways in, all the same code path:
+
+- **Drag its border.** Until beta.3 the border was draggable but nothing answered `WM_SIZE`, so
+  the swapchain kept its original size and DWM stretched it -- the picture distorted and the UI
+  never got more room (issue #44). It now really resizes: window, swapchain, banner, panel
+  texture, and ReShade's own docked tab column are all rebuilt.
+- **The overlay sliders** ("Host window width" / "Host window height") in the 32-bit game. These
+  used to write the ini only, so they appeared to do nothing until the host was restarted; they
+  now apply immediately over IPC v8.
+- **`[DLSS5Host] WindowWidth` / `WindowHeight` in `host64\ReShade.ini`**, still read at startup
+  and still written back with their in-use values, so the choice survives a restart.
+
+Default width is **900** (was 620, which left under 500 px for the consumer's panel once
+ReShade's own chrome was accounted for). `WindowHeight=0` means auto/full work-area height, and
+it may legitimately exceed the monitor: the window is normally hidden behind the game and never
+composited on screen at OS size. Clamps are 300-4000 wide, 300-8000 tall.
+
+On a deliberate resize the ReShade dock layout is re-fitted **even if the user has arranged it**
+-- deferring to a hand-arranged layout is right at startup and wrong when the user has just
+dragged the window, which is what made "expanding it doesn't scale correctly" reproducible.
+
+The in-game cast panel also has a **corner** now (`cast_anchor`, overlay: "Panel corner"). It was
+hard-coded to the top-right. This is separate from "Panel size (%)", which only scales the
+picture rather than giving the UI more room.
 
 ## 8. Optional: Alex's Toolkit (multi-pass DLSS 5 cascade)
 
