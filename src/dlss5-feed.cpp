@@ -139,6 +139,7 @@ static void Warn(const char *fmt, ...)
 // which it is not: the useful half of the line is the faulting module (issue #44).
 #include "feed_ofa.h"
 #include "feed_velocity.h"
+#include "feed_early_color.h"
 #include "feed_adapt.h"
 #include "feed_lightstab.h"
 
@@ -984,6 +985,8 @@ static void CfgWriteDefault()
             "velocity_cand=%d\n"
             "velocity_decode=%d\n"
             "velocity_scale=%.3f\n"
+            "early_color=%d\n"
+            "early_color_cand=%d\n"
             "log_detail=%d\n"
             "log_detail_every=%d\n"
             "light_stab=%d\n"
@@ -1004,6 +1007,7 @@ static void CfgWriteDefault()
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
             g_feed_ofa_cfg.enabled, g_feed_ofa_cfg.grid, g_feed_ofa_cfg.perf, g_feed_velocity_cfg.enabled,
             g_feed_velocity_cfg.cand, g_feed_velocity_cfg.decode, g_feed_velocity_cfg.scale,
+            g_feed_early_color_cfg.enabled, g_feed_early_color_cfg.cand,
             g_feed_diag_cfg.enabled, g_feed_diag_cfg.every_n,
             g_feed_lightstab_cfg.enabled, g_feed_lightstab_cfg.strength, g_feed_lightstab_cfg.max_delta,
             g_feed_adapt_cfg.mask_thr, g_feed_adapt_cfg.mask_thr_vel, g_feed_adapt_cfg.luma_thr,
@@ -1092,6 +1096,8 @@ static bool CfgReload()
             g_feed_velocity_cfg.decode = (iv < 0 || iv > 3) ? FeedVelDecode_Auto : iv;
         else if (_stricmp(key, "velocity_scale") == 0)
             g_feed_velocity_cfg.scale = (val < 0.05f) ? 0.05f : (val > 8.f ? 8.f : val);
+        else if (_stricmp(key, "early_color") == 0) g_feed_early_color_cfg.enabled = iv ? 1 : 0;
+        else if (_stricmp(key, "early_color_cand") == 0) g_feed_early_color_cfg.cand = iv;
         else if (_stricmp(key, "log_detail") == 0) g_feed_diag_cfg.enabled = iv ? 1 : 0;
         else if (_stricmp(key, "log_detail_every") == 0) g_feed_diag_cfg.every_n = iv > 0 ? iv : 60;
         else if (_stricmp(key, "light_stab") == 0) g_feed_lightstab_cfg.enabled = iv ? 1 : 0;
@@ -1158,6 +1164,7 @@ static const char *const kCfgSavedKeys[] = {
     "work_sharpness", "gpu_timeout_ms", "buffer_home", "async_home", "sync_home",
     "mv_scale_x", "mv_scale_y", "stall_log_ms",
     "ofa_enabled", "ofa_grid", "ofa_perf", "engine_velocity", "velocity_cand", "velocity_decode", "velocity_scale",
+    "early_color", "early_color_cand",
     "log_detail", "log_detail_every", "light_stab", "light_stab_strength", "light_stab_max_delta",
     "adapt_mask_thr", "adapt_mask_thr_vel", "adapt_luma_thr", "evaluate_stride",
     "quality_preset", "auto_profile_applied", "auto_profile",
@@ -1217,6 +1224,7 @@ static void CfgSave()
             "buffer_home=%d\nasync_home=%d\nsync_home=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\nstall_log_ms=%d\n"
             "ofa_enabled=%d\nofa_grid=%d\nofa_perf=%d\nengine_velocity=%d\n"
             "velocity_cand=%d\nvelocity_decode=%d\nvelocity_scale=%.3f\n"
+            "early_color=%d\nearly_color_cand=%d\n"
             "log_detail=%d\nlog_detail_every=%d\n"
             "light_stab=%d\nlight_stab_strength=%.3f\nlight_stab_max_delta=%.3f\n"
             "adapt_mask_thr=%.3f\nadapt_mask_thr_vel=%.3f\nadapt_luma_thr=%.3f\n"
@@ -1229,6 +1237,7 @@ static void CfgSave()
             g_cfg.sync_home, g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.stall_log_ms,
             g_feed_ofa_cfg.enabled, g_feed_ofa_cfg.grid, g_feed_ofa_cfg.perf, g_feed_velocity_cfg.enabled,
             g_feed_velocity_cfg.cand, g_feed_velocity_cfg.decode, g_feed_velocity_cfg.scale,
+            g_feed_early_color_cfg.enabled, g_feed_early_color_cfg.cand,
             g_feed_diag_cfg.enabled, g_feed_diag_cfg.every_n,
             g_feed_lightstab_cfg.enabled, g_feed_lightstab_cfg.strength, g_feed_lightstab_cfg.max_delta,
             g_feed_adapt_cfg.mask_thr, g_feed_adapt_cfg.mask_thr_vel, g_feed_adapt_cfg.luma_thr,
@@ -4108,6 +4117,9 @@ static void ShutdownSession()
     FeedLightStabRelease();
     FeedVelocityReleaseOut();
     FeedVelocityReleaseBlit();
+    FeedEarlyColorReleaseOut();
+    FeedEarlyColorReleaseSnap();
+    FeedEarlyColorReleaseBlit();
     ReleaseFrameResources();
     if (g.params != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
     if (g.ngx_inited && g.dev12 != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
@@ -6589,6 +6601,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
     // Phase 3: engine velocity RT hunter (cfg: engine_velocity=1). Wins over OFA / Lumenite.
     FeedVelocityBeginFrame(cd.Width, cd.Height);
+    FeedEarlyColorBeginFrame(cd.Width, cd.Height);
     if (g_feed_velocity_cfg.enabled && (g.frames_done % 120) == 1)
         FeedVelocityTryBind(rt, cd.Width, cd.Height);
     float vel_scale_x = g_cfg.mv_scale_x, vel_scale_y = g_cfg.mv_scale_y;
@@ -6614,6 +6627,21 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         }
     }
 
+    // Early color: optional SceneColor snap → SLOT_COLOR (else Present backbuffer).
+    ID3D11Texture2D *early_color = nullptr;
+    if (g_feed_early_color_cfg.enabled)
+    {
+        ID3D11Device *edev = nullptr;
+        ctx->GetDevice(&edev);
+        if (edev != nullptr)
+        {
+            early_color = FeedEarlyColorAcquire(edev, ctx, cd.Width, cd.Height, cd.Format);
+            FeedEarlyColorAfterAcquire();
+            edev->Release();
+        }
+    }
+    ID3D11Texture2D *color_in = early_color != nullptr ? early_color : color;
+
     {
         const bool ofa_cap = true; // D3D11 feed path
         FeedAutoProfileTick(g.frames_done, ofa_cap);
@@ -6625,7 +6653,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         ctx->GetDevice(&ofa_dev);
         if (ofa_dev != nullptr)
         {
-            if (ID3D11Texture2D *ofa_mv = FeedOfaUpdate(ofa_dev, ctx, color, cd.Format, cd.Width, cd.Height))
+            if (ID3D11Texture2D *ofa_mv = FeedOfaUpdate(ofa_dev, ctx, color_in, cd.Format, cd.Width, cd.Height))
             {
                 SafeRelease(mv);
                 mv = ofa_mv;
@@ -6730,7 +6758,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
             HaltonJitter(g.jitter_index, g.jitter_phases, &g.jitter_x, &g.jitter_y);
         }
         Breadcrumb("preparing work-resolution inputs");
-        ok = CopyOrResampleInputs(ctx, color, mv, depth, mask,
+        ok = CopyOrResampleInputs(ctx, color_in, mv, depth, mask,
                                   nullptr,
                                   reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
                                   reinterpret_cast<ID3D11ShaderResourceView *>(d_srv.handle),
@@ -6914,6 +6942,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     }
 
     SafeRelease(color);
+    SafeRelease(early_color);
     SafeRelease(mv);
     SafeRelease(depth);
     SafeRelease(mask);
@@ -7767,6 +7796,52 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         ImGui::TextDisabled("Enable Motion Blur in-game if the list stays empty");
     }
 
+    ImGui::Separator();
+    ImGui::TextUnformatted("Early color (D3D11 SceneColor snap)");
+    bool early_on = g_feed_early_color_cfg.enabled != 0;
+    if (ImGui::Checkbox("Hunt & feed early color RT (off by default)", &early_on))
+    { g_feed_early_color_cfg.enabled = early_on ? 1 : 0; dirty = true; }
+    ImGui::SameLine(); HelpMarker(
+        "Tracks full-res HDR/RGBA SceneColor-like RTs mid-frame. When a fresh snap exists, "
+        "NR feeds from that snap instead of the Present backbuffer (less double-TAA). "
+        "MVP still blits NR over the backbuffer — UI/HUD may be missing. "
+        "Fallback: Present path. Cfg: early_color / early_color_cand.");
+    {
+        const bool early_active = g_feed_early_color.using_early;
+        ImGui::TextColored(
+            early_active ? ImVec4(0.5f, 0.9f, 0.5f, 1.0f) : ImVec4(0.75f, 0.75f, 0.55f, 1.0f),
+            "Color path: %s", g_feed_early_color.status_line[0] ? g_feed_early_color.status_line : "fallback Present");
+        ImGui::TextWrapped("%s", g_feed_early_color.overlay_line[0] ? g_feed_early_color.overlay_line : "");
+        ImGui::TextDisabled("Candidates: %d", g_feed_early_color.cand_count);
+        if (g_feed_early_color.cand_count > 0)
+        {
+            static char elabels[32][96];
+            static const char *eptrs[33];
+            int n = 0;
+            _snprintf_s(elabels[0], sizeof(elabels[0]), _TRUNCATE, "Auto (best score)");
+            eptrs[n++] = elabels[0];
+            const int max_show = g_feed_early_color.cand_count < 31 ? g_feed_early_color.cand_count : 31;
+            for (int i = 0; i < max_show; ++i)
+            {
+                const FeedEarlyColorCand &c = g_feed_early_color.cands[i];
+                _snprintf_s(elabels[i + 1], sizeof(elabels[i + 1]), _TRUNCATE,
+                            "#%d %s %ux%u score=%d%s", i, FeedEarlyColorFmtLabel(c.fmt),
+                            c.width, c.height, c.score, c.name_hit ? " *" : "");
+                eptrs[i + 1] = elabels[i + 1];
+                n++;
+            }
+            int sel = g_feed_early_color_cfg.cand < 0 ? 0 : g_feed_early_color_cfg.cand + 1;
+            if (sel >= n) sel = 0;
+            if (ImGui::Combo("Early color candidate", &sel, eptrs, n))
+            {
+                g_feed_early_color_cfg.cand = (sel <= 0) ? -1 : sel - 1;
+                dirty = true;
+            }
+        }
+        if (ImGui::Button("Rescan early color RTs"))
+        { FeedEarlyColorClearCands(); dirty = true; }
+    }
+
     ImGui::TextWrapped("Change the provider with DLSS5_Feed.fx's DLSS5_MV_PROVIDER preprocessor definition: "
                        "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion.");
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
@@ -7809,18 +7884,21 @@ static void OnBindRenderTargets(reshade::api::command_list *cmd_list, uint32_t c
                                 const reshade::api::resource_view *rtvs, reshade::api::resource_view dsv)
 {
     FeedVelocityOnBindRTs(cmd_list, count, rtvs, dsv);
+    FeedEarlyColorOnBindRTs(cmd_list, count, rtvs, dsv);
 }
 
 static bool OnDraw(reshade::api::command_list *cmd_list, uint32_t /*vertices*/, uint32_t /*instances*/,
                    uint32_t /*first_vertex*/, uint32_t /*first_instance*/)
 {
-    return FeedVelocityOnDraw(cmd_list);
+    FeedVelocityOnDraw(cmd_list);
+    return FeedEarlyColorOnDraw(cmd_list);
 }
 
 static bool OnDrawIndexed(reshade::api::command_list *cmd_list, uint32_t /*indices*/, uint32_t /*instances*/,
                           uint32_t /*first_index*/, int32_t /*vertex_offset*/, uint32_t /*first_instance*/)
 {
-    return FeedVelocityOnDraw(cmd_list);
+    FeedVelocityOnDraw(cmd_list);
+    return FeedEarlyColorOnDraw(cmd_list);
 }
 
 static void OnInitResource(reshade::api::device *device, const reshade::api::resource_desc &desc,
@@ -7828,11 +7906,13 @@ static void OnInitResource(reshade::api::device *device, const reshade::api::res
                            reshade::api::resource resource)
 {
     FeedVelocityOnInitResource(device, desc, resource);
+    FeedEarlyColorOnInitResource(device, desc, resource);
 }
 
 static void OnDestroyResource(reshade::api::device *, reshade::api::resource resource)
 {
     FeedVelocityOnDestroyResource(resource);
+    FeedEarlyColorOnDestroyResource(resource);
 }
 
 // Fired by ReShade before the device (for Vulkan: from inside its vkCreateInstance
