@@ -74,7 +74,8 @@
 > | symptom | where | status |
 > |---|---|---|
 > | `NVSDK_NGX_D3D12_Init -> 0xBAD00001` on a 64-bit game, while the same files succeed for 32-bit games | [#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47) | Open, **per-game**. GPU architecture, driver, data path, adapter, model build and game provenance have each been eliminated by counter-example. |
-> | Works for minutes, then the neural pass stops; log says `device removed … 0x887A0006` | [#57](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/57) | Open. A GPU hang; 0.14.0-beta.2 arms the D3D12 breadcrumb recorder on the D3D11 path, which was missing. |
+> | Works for minutes, then the neural pass stops; log says `device removed … 0x887A0006` | [#57](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/57), [#63](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/63) | Open. A GPU hang in **this project's own private queue** (three DRED nodes = the three-frame ring), with no page fault. 0.14.0-beta.5 names every D3D12 object and brackets the frame into `copy-in` / `ngx-evaluate` / `copy-home`, so the next breadcrumb says which phase hung. |
+> | `feature 18 create failed … 0xBAD00001` on a GTX/RTX 20-series card | [#73](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/73) | **Not a bug.** DLSS 5 neural rendering has a minimum GPU architecture that Turing and older are below. 0.14.0-beta.5 says so in the log instead of leaving you to read the support bits. |
 > | Severe flicker or a frozen image on 64-bit **Vulkan** | [#13](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/13) | Open. Narrowed: the transport is clean, the depth guide reaching NGX is a constant. |
 >
 > ### 4. If you report something
@@ -1276,6 +1277,22 @@ Common cases:
   From 0.11.0-beta.2 the helper creates the shared set instead (the log says `the host will
   create the shared set instead`); on older builds there is no workaround (`mode=1` uses the same
   texture).
+* **64-bit game: `Output: … failed 0x80070057`, then `failure: resource build` three times and
+  `stopped: repeated failures`** — the same refusal as the 32-bit case above, on the in-process
+  path: `Output` is the only one of the four shared textures created with an unordered-access
+  bind, and some D3D11 devices accept every other slot at the identical size and format and
+  refuse that one. Until 0.14.0-beta.5 there was no fallback here and the session latched off
+  ([#70](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/70)). From beta.5 the shared Output
+  is rebuilt without the UAV, DLSS writes a private texture, and the result is copied into the
+  shared one on the same command list — the log says `shared copy without UAV, DLSS writes a
+  private texture`. The failure line now also names *which* call refused (`CreateCommittedResource`
+  / `CreateSharedHandle` / `OpenSharedResource1`) and prints the device's feature level.
+* **`NVSDK_NGX_D3D12_Init` fails and the log blames your device or driver** — check the line just
+  above it. If NGX answered the *capability query* with `0xBAD00002 PlatformError`, it refused a
+  question that touches no device at all, and the problem is something else loaded into the game
+  (an overlay, an injector, anti-cheat, another NGX consumer) rather than your GPU or driver.
+  0.14.0-beta.5 says that in the failure line instead of the old catch-all
+  ([#47](https://github.com/jlrouzies-fr/DLSS5-Feeder/issues/47)).
 * **The game crashed** — `dlss5-feed.log` (or `dlss5-feed-host.log`) ends with
   `### CRASH RECORDED ###`, naming the exception, the module it faulted in and what the feeder was
   doing at the time, and from 0.11.0-beta.2 a `dlss5-feed-crash.dmp` is written next to it. Post

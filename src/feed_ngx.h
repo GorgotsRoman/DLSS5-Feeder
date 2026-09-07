@@ -283,11 +283,65 @@ static void FeedFormatFeatureSupport(unsigned bits, char *out, size_t out_size)
     if (n >= 2) out[n - 2] = 0;   // trim the trailing ", "
 }
 
+// What the probe concluded, kept so the FAILURE message can say it.
+//
+// Until 0.14.0-beta.5 this probe only logged. That cost real support time twice over:
+//
+//  - #47/#72: every failing log shows GetFeatureRequirements(SuperSampling) answering
+//    0xBAD00002 PlatformError ~7 ms BEFORE Init fails. That query touches no device and
+//    creates no feature -- NGX has already declined to answer anything in this process. Yet
+//    the user was then told "NGX would not initialise on this device/driver", which points at
+//    hardware, and sent people reinstalling drivers on machines where the same files work for
+//    other games minutes later.
+//  - #73: a pre-Ada card cannot run feature 18 at all. The probe knew (ADAPTER unsupported)
+//    and printed it among four other fields; nothing ever said so in plain words.
+//
+// So the probe now hands its verdict back and the failure text is written from it.
+struct FeedNgxVerdict
+{
+    bool             asked;          // the probe ran (an adapter was available)
+    NVSDK_NGX_Result ss_query;       // the SuperSampling requirements query itself
+    NVSDK_NGX_Result nr_query;       // the feature-18 requirements query itself
+    unsigned         nr_bits;        // FeatureSupported for 18, when the query answered
+    unsigned         nr_min_arch;    // MinHWArchitecture for 18, when the query answered
+};
+
+// NGX refused a pure capability question, before any device was involved. Not the GPU and
+// not the driver: something in THIS PROCESS is blocking NGX.
+static bool FeedNgxBlockedInProcess(const FeedNgxVerdict &v)
+{
+    return v.asked && static_cast<unsigned>(v.ss_query) == 0xBAD00002u;
+}
+
+// NGX answered, and the answer is that this GPU is below the floor for neural rendering.
+static bool FeedNgxAdapterTooOld(const FeedNgxVerdict &v)
+{
+    return v.asked && NVSDK_NGX_SUCCEED(v.nr_query) && (v.nr_bits & 4u) != 0u;
+}
+
+// The one sentence to show a user when the session will not start. Never blames hardware
+// unless NGX actually said hardware.
+static const char *FeedNgxWhyNot(const FeedNgxVerdict &v)
+{
+    if (FeedNgxBlockedInProcess(v))
+        return "NGX refused even the capability query in this process, before any device existed -- "
+               "this is not your GPU and not your driver. Something else loaded into this game "
+               "(an overlay, an injector, anti-cheat, or another NGX consumer) is blocking NGX";
+    if (FeedNgxAdapterTooOld(v))
+        return "this GPU is below the minimum architecture DLSS 5 neural rendering requires -- "
+               "no application can run the neural pass on it. DLAA from this project still works; "
+               "the neural pass will not";
+    return "NGX would not initialise on this device/driver";
+}
+
 static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const char *tag,
                                           IDXGIAdapter *adapter, const wchar_t *data_path,
-                                          const NVSDK_NGX_FeatureCommonInfo *info)
+                                          const NVSDK_NGX_FeatureCommonInfo *info,
+                                          FeedNgxVerdict *out = nullptr)
 {
+    if (out != nullptr) { FeedNgxVerdict blank = {}; *out = blank; }
     if (adapter == nullptr) { log("[%s] NGX feature requirements: no adapter to ask about", tag); return; }
+    if (out != nullptr) out->asked = true;
 
     struct Probe { NVSDK_NGX_Feature id; const char *name; };
     const Probe probes[] = {
@@ -307,10 +361,19 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
 
         NVSDK_NGX_FeatureRequirement req = {};
         const NVSDK_NGX_Result r = NVSDK_NGX_D3D12_GetFeatureRequirements(adapter, &di, &req);
+        const bool is_nr = (static_cast<unsigned>(pr.id) == 18u);
+        if (out != nullptr) { if (is_nr) out->nr_query = r; else out->ss_query = r; }
         if (NVSDK_NGX_FAILED(r))
         {
             log("[%s] NGX feature requirements: %s -> the query itself failed 0x%08X (%s)",
                 tag, pr.name, r, NgxResultName(r));
+            // This query touches no device and creates no feature. PlatformError here means
+            // NGX has already declined to answer anything in this process, and everything
+            // that fails afterwards is a consequence rather than a cause (#47, #72).
+            if (static_cast<unsigned>(r) == 0xBAD00002u)
+                log("[%s]   NGX answered a pure capability question with PlatformError: it is refusing this "
+                    "PROCESS, not this GPU or driver. Look for another overlay, injector, anti-cheat or "
+                    "NGX consumer loaded into the game", tag);
             continue;
         }
         char why[192];
@@ -318,5 +381,21 @@ static void FeedLogNgxFeatureRequirements(void (*log)(const char *, ...), const 
         log("[%s] NGX feature requirements: %s -> %s (min GPU architecture 0x%X, min OS %s)",
             tag, pr.name, why, req.MinHWArchitecture,
             req.MinOSVersion[0] != 0 ? req.MinOSVersion : "unstated");
+        if (out != nullptr && is_nr)
+        {
+            out->nr_bits     = static_cast<unsigned>(req.FeatureSupported);
+            out->nr_min_arch = req.MinHWArchitecture;
+        }
+        // Say the hardware verdict in words. The bits above are correct and nobody reads them:
+        // a 2080 Ti owner sees "feature 18 create failed 0xBAD00001" and files a bug (#73),
+        // because nothing ever told them Turing is below the floor for neural rendering.
+        if (is_nr && (req.FeatureSupported & 4) != 0)
+            log("[%s]   *** This GPU is below the minimum architecture for DLSS 5 neural rendering "
+                "(NGX wants 0x%X). No application can run the neural pass on it. DLAA from this "
+                "project still works; the neural pass will not. ***", tag, req.MinHWArchitecture);
+        else if (is_nr && (req.FeatureSupported & 2) != 0)
+            log("[%s]   *** The DRIVER is below the minimum for DLSS 5 neural rendering (min OS %s). "
+                "Update the NVIDIA driver. ***", tag,
+                req.MinOSVersion[0] != 0 ? req.MinOSVersion : "unstated");
     }
 }

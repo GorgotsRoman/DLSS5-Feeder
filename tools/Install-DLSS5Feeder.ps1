@@ -61,7 +61,7 @@
     A folder holding any of the pieces you already have; each is used instead of a
     download when found there (matched by name): DLSS5-Feeder-*.zip,
     ReShade_Setup_*_Addon.exe, Deep-Fried-Chicken*.zip, nvngx_dlssnr.dll, nvngx_dlss.dll,
-    renodx-dlss5.addon64, LumeniteFX*.zip, dgVoodoo2_*.zip, ReShade.fxh, ReShadeUI.fxh,
+    renodx-dlss5*.addon64, LumeniteFX*.zip, dgVoodoo2_*.zip, ReShade.fxh, ReShadeUI.fxh,
     DrawText.fxh.
 
 .PARAMETER FeederZip, DfcZip, DlssNrDll, DlssDll, RenoDxAddon, ReShadeSetup, LumeniteZip, DgVoodooZip
@@ -355,6 +355,22 @@ function Find-FileIn
     }
     catch { }
     return $null
+}
+
+# Every match, not just the first. The RenoDX add-on ships under versioned names as well
+# ('renodx-dlss5-4.7.addon64'), and ReShade loads EVERY *.addon64 in the folder. Disabling only
+# the exactly-named one left a versioned copy loaded beside Deep Fried Chicken -- the state that
+# makes Chicken silently inert while every check still reads healthy (#44). The C++ side has
+# matched the prefix since #1 (FindRenodxAddon, src/dlss5-feed.cpp:320).
+function Find-FilesIn
+{
+    param([string] $Dir, [string] $Name)
+    if (-not (Test-DirHere $Dir)) { return @() }
+    try {
+        $hits = @(Get-ChildItem -LiteralPath $Dir -File -Filter $Name -ErrorAction SilentlyContinue)
+        return $hits
+    }
+    catch { return @() }
 }
 
 function Find-FileUnder
@@ -1598,7 +1614,7 @@ if ($Consumer -eq 'DFC') {
     }
 }
 else {
-    $renoPath = Resolve-Piece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon -LocalPattern 'renodx-dlss5.addon64' `
+    $renoPath = Resolve-Piece -Label 'RenoDX DLSS 5 add-on' -Explicit $RenoDxAddon -LocalPattern 'renodx-dlss5*.addon64' `
                               -DefaultUrl $Sources.RenoDxDlss5 -CacheName 'renodx-dlss5.addon64'
     if (-not $renoPath) {
         Report -Status 'Fail' -Text 'renodx-dlss5.addon64 is not available.' `
@@ -2069,8 +2085,10 @@ function Disable-Conflict
 
 Disable-Conflict -Path (Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64') -Why 'the DX11 bridge must never be combined with DLSS5-Feeder'
 if ($is32) {
-    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5.addon64', 'alexs-toolkit.addon64')) {
-        Disable-Conflict -Path (Find-FileIn $gameDir $n) -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
+    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
+        foreach ($f in (Find-FilesIn $gameDir $n)) {
+            Disable-Conflict -Path $f.FullName -Why 'a 64-bit add-on beside a 32-bit exe is never loaded; the consumer belongs in host64\'
+        }
     }
     # The reverse mistake, and the damaging one: this project's own 64-bit add-on inside
     # host64\. It DOES load -- host64\ is a 64-bit ReShade install -- and what loads is the
@@ -2081,7 +2099,10 @@ if ($is32) {
 }
 
 if ($Consumer -eq 'DFC') {
-    Disable-Conflict -Path (Find-FileIn $consumerDir 'renodx-dlss5.addon64') -Why 'Deep Fried Chicken stays inert while a RenoDX neural provider is loaded'
+    # Every copy, versioned names included: one left behind is enough to keep Chicken inert (#44).
+    foreach ($f in (Find-FilesIn $consumerDir 'renodx-dlss5*.addon64')) {
+        Disable-Conflict -Path $f.FullName -Why 'Deep Fried Chicken stays inert while a RenoDX neural provider is loaded'
+    }
     Disable-Conflict -Path (Find-FileIn $consumerDir 'alexs-toolkit.addon64') -Why 'a third interposer on the same NGX module; Chicken''s docs ask for it to be removed'
 
     if ($dfcPath) {

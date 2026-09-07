@@ -255,6 +255,23 @@ function Find-FileIn
     return $null
 }
 
+# Every match, not just the first. The RenoDX add-on ships under versioned names as well
+# ('renodx-dlss5-4.7.addon64'), and ReShade loads EVERY *.addon64 in the folder -- so "is one
+# present" and "which ones are present" are different questions, and the second is the one that
+# matters when two copies would both hook NGX. The C++ side has matched the prefix since #1
+# (FindRenodxAddon, src/dlss5-feed.cpp:320); this script did not, and reported a perfectly good
+# versioned install as "no neural consumer found".
+function Find-FilesIn
+{
+    param([string] $Dir, [string] $Name)
+    if (-not (Test-DirHere $Dir)) { return @() }
+    try {
+        $hits = @(Get-ChildItem -LiteralPath $Dir -File -Filter $Name -ErrorAction SilentlyContinue)
+        return $hits
+    }
+    catch { return @() }
+}
+
 # Case-insensitive recursive search under a folder. ReShade's EffectSearchPaths normally ends
 # in "**", so a header sitting in Shaders\CrosireMaster\ is found by the compiler and must be
 # treated as present here too.
@@ -351,6 +368,28 @@ function Get-PeInfo
         if ($br) { try { $br.Close() } catch { } }
         if ($fs) { try { $fs.Dispose() } catch { } }
     }
+}
+
+# Does this executable look like something that renders? A renderer names a graphics runtime
+# somewhere in its binary; a command-line tool that ships beside the game does not. Used only
+# to break a tie when the game exe is being guessed (#60) -- never to fail anything, so a
+# string scan is enough and no import-table walk is needed. Capped, like the installer's.
+function Test-ExeLooksGraphical
+{
+    param([string] $Path)
+    try {
+        $fi = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($fi.Length -eq 0 -or $fi.Length -gt 268435456) { return $false }
+        $bytes = [IO.File]::ReadAllBytes($Path)
+        $ascii = [Text.Encoding]::ASCII.GetString($bytes)
+        $wide  = [Text.Encoding]::Unicode.GetString($bytes)
+        foreach ($n in @('vulkan-1.dll', 'dxgi.dll', 'd3d12.dll', 'd3d11.dll', 'd3d10_1.dll', 'd3d10.dll', 'd3d9.dll', 'd3d8.dll', 'opengl32.dll')) {
+            $re = '(?i)(?<![\w.])' + [regex]::Escape($n)
+            if ([regex]::IsMatch($ascii, $re) -or [regex]::IsMatch($wide, $re)) { return $true }
+        }
+    }
+    catch { }
+    return $false
 }
 
 # RVA -> file offset, given a PE's section table. Split out from the reader below so the
@@ -680,17 +719,43 @@ if ($Exe) {
 
 if (-not $exePath) {
     $skip = '(?i)(launcher|unins|setup|crash|redist|vcredist|dxsetup|dxwebsetup|dgvoodoocpl|touchup|prereq|activation|helper|updater|report)'
+    # #60: "the largest exe that is not a launcher" picked studiomdl.exe -- the Source engine's
+    # model compiler -- out of a Garry's Mod bin\win64 folder, and every check after that
+    # described an install relative to a tool that never renders anything. Engine and SDK
+    # tooling ships beside the game and is often bigger than it, so size alone cannot decide.
+    $skipTool = '(?i)^(studiomdl|vbsp|vvis|vrad|hlmv|hlfaceposer|glview|height2ssbump|vtex|vtf2tga|tgadiff|motionmapper|qc_eyes|scenemanager|captioncompiler|shadercompile|bugreporter\w*|phonemeextractor|vice|vpk|dmxconvert|dmxedit|smd\w*)\.exe$'
     $exes = $null
     try {
-        $exes = Get-ChildItem -LiteralPath $gameDir -File -Filter '*.exe' -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notmatch $skip } |
-                Sort-Object Length -Descending
+        # @() so a single match is still an array: StrictMode makes .Count on a bare
+        # FileInfo a hard error, and a folder with exactly one exe is the common case.
+        $exes = @(Get-ChildItem -LiteralPath $gameDir -File -Filter '*.exe' -ErrorAction SilentlyContinue |
+                  Where-Object { $_.Name -notmatch $skip -and $_.Name -notmatch $skipTool } |
+                  Sort-Object Length -Descending)
     }
     catch { }
 
+    # Prefer an exe that actually imports a graphics runtime: a renderer imports d3d9/d3d11/
+    # d3d12/dxgi/opengl32/vulkan-1, and a command-line compiler does not. The installer already
+    # scans imports for the same reason (Install-DLSS5Feeder.ps1, Get-PeImports).
+    $exeAmbiguous = $false
     if ($exes) {
-        $exePath = $exes[0].FullName
+        $gfx = @($exes | Where-Object { Test-ExeLooksGraphical $_.FullName })
+        if ($gfx.Count -ge 1) {
+            $exePath = $gfx[0].FullName
+            $exeAmbiguous = $gfx.Count -gt 1
+        }
+        else {
+            $exePath = $exes[0].FullName
+            $exeAmbiguous = $exes.Count -gt 1
+        }
         $exeGuessed = $true
+    }
+
+    # Say so when the pick was a coin toss, instead of reporting the rest of the run as fact.
+    if ($exeGuessed -and $exeAmbiguous) {
+        Report -Status 'Warn' -Text ('The game executable was guessed: ' + [IO.Path]::GetFileName($exePath)) `
+               -Detail 'Several executables in this folder could be the game, and everything below is measured against this one.' `
+               -Action 'If that is the wrong one, re-run with -Exe "<the game exe>".'
     }
 }
 
@@ -753,9 +818,28 @@ $api = 'unknown'
 $apiDetail = ''
 $isVulkan = $false
 
-if ($d3d9Local -and $dgVoodooConf) {
+# #60: "a d3d9.dll plus a dgVoodoo.conf" is not proof of dgVoodoo2. The DLL can be ReShade's
+# own Direct3D 9 hook, and the conf can be a leftover from an install that was later disabled
+# (#56 is exactly that state). Ask the file who it is before claiming the whole route.
+$dgVoodooWrapper = $false
+if ($d3d9Local) {
+    $d9name = Get-ProductNameSafe $d3d9Local
+    if ($d9name -and $d9name -match '(?i)dgvoodoo') { $dgVoodooWrapper = $true }
+    elseif (-not $d9name) {
+        $dgVoodooWrapper = [bool](Get-BinaryMarker -Path $d3d9Local -Pattern 'dgVoodoo' -MaxBytes 16777216)
+    }
+}
+
+if ($d3d9Local -and $dgVoodooConf -and $dgVoodooWrapper) {
     $api = 'Direct3D 9 via dgVoodoo2 (translated to D3D11)'
-    $apiDetail = 'Inferred from a local d3d9.dll plus dgVoodoo.conf. ReShade hooks the D3D11 device dgVoodoo2 creates, so ReShade itself is the local dxgi.dll.'
+    $apiDetail = 'The local d3d9.dll identifies itself as dgVoodoo2 and dgVoodoo.conf is present. ReShade hooks the D3D11 device dgVoodoo2 creates, so ReShade itself is the local dxgi.dll.'
+}
+elseif ($d3d9Local -and $dgVoodooConf -and -not $dgVoodooWrapper) {
+    $api = 'Direct3D 9 (dgVoodoo.conf present, but the local d3d9.dll is not dgVoodoo2)'
+    $apiDetail = 'dgVoodoo.conf is here but the d3d9.dll beside it does not identify itself as dgVoodoo2 -- most likely a leftover conf from an install that was replaced or disabled.'
+    Report -Status 'Fail' -Text 'The dgVoodoo2 wrapper is not actually in place.' `
+           -Detail $apiDetail `
+           -Action 'Re-run Install-DLSS5Feeder.ps1 for this game, or copy dgVoodoo2''s D3D9.dll (D3D8.dll for a Direct3D 8 game) next to the exe.'
 }
 elseif ($reshadeLocalName -eq 'opengl32.dll') {
     $api = 'OpenGL'
@@ -764,6 +848,16 @@ elseif ($reshadeLocalName -eq 'opengl32.dll') {
 elseif ($reshadeLocalName -eq 'dxgi.dll') {
     $api = 'Direct3D 10/11/12'
     $apiDetail = 'Inferred from a local ReShade dxgi.dll.'
+}
+elseif ($reshadeLocalName -eq 'd3d9.dll') {
+    # #60: this used to report a bland "Direct3D (hooked via d3d9.dll)" and carry on, so a
+    # Direct3D 9 game with no wrapper -- which this project cannot touch at all -- looked like
+    # a normal install right up to the shader's compile error. Say it here instead.
+    $api = 'Direct3D 9 (ReShade is on its D3D9 backend)'
+    $apiDetail = 'The local ReShade DLL is d3d9.dll, so ReShade is running its Direct3D 9 backend.'
+    Report -Status 'Fail' -Text 'Direct3D 9 is not supported directly.' `
+           -Detail 'This project attaches to Direct3D 10/11/12, OpenGL and Vulkan. On ReShade''s D3D9 backend there is no D3D11/D3D12 device to share textures with, and DLSS5_Feed.fx refuses to compile (it reports this in plain language). A 64-bit D3D9 game is best served by ShortFuse''s renodx-dlss standalone, which needs no feeder.' `
+           -Action 'For a 32-bit D3D9 game, install dgVoodoo2 so the game runs on D3D11 and point ReShade at dxgi.dll -- Install-DLSS5Feeder.ps1 does this. Otherwise use renodx-dlss on its own.'
 }
 elseif ($reshadeLocalName) {
     $api = 'Direct3D (hooked via ' + $reshadeLocalName + ')'
@@ -1050,15 +1144,16 @@ else {
 }
 
 $dfcAddon   = Find-FileIn $consumerDir 'deep-fried-chicken.addon64'
-$renoAddon  = Find-FileIn $consumerDir 'renodx-dlss5.addon64'
+$renoAddon  = Find-FileIn $consumerDir 'renodx-dlss5*.addon64'
 $toolkit    = Find-FileIn $consumerDir 'alexs-toolkit.addon64'
 $dx11Bridge = Find-FileIn $consumerDir 'dlss5-dx11-bridge.addon64'
 
 if ($gameBits -eq 32) {
     # A 64-bit add-on beside a 32-bit exe is the single most common 32-bit deploy mistake.
-    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5.addon64', 'alexs-toolkit.addon64')) {
+    foreach ($n in @('deep-fried-chicken.addon64', 'renodx-dlss5*.addon64', 'alexs-toolkit.addon64')) {
         $stray = Find-FileIn $gameDir $n
         if ($stray) {
+            $n = [IO.Path]::GetFileName($stray)   # the versioned name, not the pattern
             Report -Status 'Fail' -Text ($n + ' is next to the 32-bit game exe -- wrong place.') `
                    -Detail 'This game is 32-bit, so the neural consumer must live in host64\ where the 64-bit helper process loads it. A 64-bit add-on beside an x86 exe is never loaded by anything.' `
                    -Action ('Move ' + $n + ' into ' + $hostDir)
@@ -1109,8 +1204,16 @@ elseif ($dfcAddon) {
     }
 }
 elseif ($renoAddon) {
-    Report -Status 'Ok' -Text 'renodx-dlss5.addon64 present (supported alternative).' `
+    Report -Status 'Ok' -Text ([IO.Path]::GetFileName($renoAddon) + ' present (supported alternative).') `
            -Detail ('in ' + $consumerWhere + '. Deep Fried Chicken is the recommended default.')
+    # ReShade loads every *.addon64 in the folder, so a second copy is not redundant -- both
+    # hook NGX and the result is undefined.
+    $renoAll = @(Find-FilesIn $consumerDir 'renodx-dlss5*.addon64')
+    if ($renoAll.Count -gt 1) {
+        Report -Status 'Warn' -Text 'More than one renodx-dlss5 add-on is present.' `
+               -Detail (($renoAll | ForEach-Object { $_.Name }) -join ', ') `
+               -Action ('Keep one of them in ' + $consumerDir + ' and remove or rename the rest.')
+    }
 }
 else {
     Report -Status 'Fail' -Text 'No neural consumer found.' `

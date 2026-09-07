@@ -62,7 +62,7 @@
 #include "feed_dfc.h"  // Deep Fried Chicken interop ABI 1 (producer side)
 #include "feed_fsr1.h" // AMD FSR 1 EASU + RCAS: the optional expand-back for work_resolution < 100%
 
-#define FEED_VERSION "0.14.0-beta.4"
+#define FEED_VERSION "0.14.0-beta.5"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -1359,6 +1359,12 @@ struct Feed
     ID3D12Resource  *tex12[SLOT_COUNT];
     ID3D11Texture2D *tex11[SLOT_COUNT];
     HANDLE           shared[SLOT_COUNT];
+    // #70: some D3D11 devices refuse to open a SHARED texture that carries a UAV bind, and
+    // Output is the only slot that needs one. When that happens the shared Output is built
+    // without the UAV and NGX evaluates into this private, unshared texture instead; the
+    // result is copied into the shared one on the same command list. Null on every device
+    // that opens the UAV texture normally, which is the overwhelming majority.
+    ID3D12Resource  *out_scratch;
     ID3D11ShaderResourceView *output_srv;   // on tex11[SLOT_OUTPUT], for the copy-back blit
     ID3D11Texture2D          *color_stage;     // native-size copy of the frame, the only SRV-able source we get
     ID3D11ShaderResourceView *color_stage_srv; // its SRV, sampled by the work-resolution downsample
@@ -1914,6 +1920,17 @@ static bool NgxPathWritable(const wchar_t *dir)
 // Ask NGX which of the adapter, the driver or the OS it is objecting to. Resolves the
 // device's own adapter by LUID, because GetFeatureRequirements takes an IDXGIAdapter and
 // the sessions here are opened on three different ones.
+// The last verdict the probe reached, so the failure message can be written from what NGX
+// actually said instead of the old catch-all that blamed the device or the driver (#47, #73).
+static FeedNgxVerdict g_ngx_verdict = {};
+
+// The sentence to show when the session will not start. Falls back to the historical wording
+// when the probe never ran or NGX had no opinion.
+static const char *NgxFailureReason()
+{
+    return FeedNgxWhyNot(g_ngx_verdict);
+}
+
 static void NgxAskWhy(ID3D12Device *dev, const wchar_t *data_path)
 {
     if (dev == nullptr) return;
@@ -1937,7 +1954,7 @@ static void NgxAskWhy(ID3D12Device *dev, const wchar_t *data_path)
                               reinterpret_cast<void **>(&ad));
         f4->Release();
     }
-    FeedLogNgxFeatureRequirements(&Log, "feed", ad, data_path, &info);
+    FeedLogNgxFeatureRequirements(&Log, "feed", ad, data_path, &info, &g_ngx_verdict);
     if (ad != nullptr) ad->Release();
 }
 
@@ -2415,6 +2432,30 @@ static void DepthProbeAnalyse()
                               "that is fixed"
                      : flat ? "  <-- sampled depth is flat; inspect the depth debug view / Generic Depth settings" : "");
     Log("[feed] %s", g_depth_probe);
+
+    // #13: on Detroit the probe's `max` is bit-identical (0.0231628) across a 65x change in
+    // scene complexity, two transports and two present modes. The probe reads the resource
+    // AFTER transport, so a constant here localises the fault to the DLSS5_Depth pass or the
+    // copy into the shared texture -- but only if the resource itself is what we think it is.
+    // Nothing ever logged its actual description, so "the transport is clean" rested on an
+    // assumption. Print it once per session, next to the numbers it explains.
+    static bool desc_said = false;
+    if (!desc_said && g.tex12[SLOT_DEPTH] != nullptr)
+    {
+        desc_said = true;
+        const D3D12_RESOURCE_DESC dd = g.tex12[SLOT_DEPTH]->GetDesc();
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {};
+        UINT   rows = 0;
+        UINT64 row_bytes = 0, total = 0;
+        if (g.dev12 != nullptr) g.dev12->GetCopyableFootprints(&dd, 0, 1, 0, &fp, &rows, &row_bytes, &total);
+        Log("[feed]   depth resource as handed to NGX: %llux%u %s, %u mip(s), %u sample(s), layout %d, "
+            "flags 0x%X, footprint %ux%u pitch %u, %llu row bytes, %llu total; feed work size %ux%u",
+            static_cast<unsigned long long>(dd.Width), dd.Height, FormatName(dd.Format),
+            dd.MipLevels, dd.SampleDesc.Count, static_cast<int>(dd.Layout), static_cast<unsigned>(dd.Flags),
+            fp.Footprint.Width, fp.Footprint.Height, fp.Footprint.RowPitch,
+            static_cast<unsigned long long>(row_bytes), static_cast<unsigned long long>(total),
+            g.width, g.height);
+    }
 }
 
 static void GuideProbeAnalyse()
@@ -2759,6 +2800,7 @@ static void ReleaseFrameResources()
     SafeRelease(g.easu_srv);
     SafeRelease(g.easu_rtv);
     SafeRelease(g.easu_tex);
+    SafeRelease(g.out_scratch);   // #70: the private UAV target, when this device needed one
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
         SafeRelease(g.input_rtv[i]);
@@ -2774,6 +2816,10 @@ static void ReleaseFrameResources()
     }
     g.frame_ready = false;
 }
+
+// Defined with the other DRED helpers, below; the resource builders here need it as soon as
+// the shared set exists so a breadcrumb can name our textures (#63).
+static void FeedNameD3D12Objects();
 
 // One texture visible to both APIs: created on D3D12 and opened on D3D11, or the other
 // way round if the driver refuses (WD2's driver only accepted the second route).
@@ -2795,19 +2841,31 @@ static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORM
                           (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
                           (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
 
+    // Which of the three calls failed, by name. They used to collapse into one line, so a
+    // reporter's "D3D12->D3D11 path failed 0x80070057" could not say whether the D3D12 device
+    // refused to create the resource, refused to share it, or the D3D11 device refused to open
+    // it -- and those are three different problems with three different answers (#70).
+    const char *step = "CreateCommittedResource";
     HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, __uuidof(ID3D12Resource),
                                                   reinterpret_cast<void **>(&g.tex12[i]));
     if (SUCCEEDED(hr))
+    {
+        step = "CreateSharedHandle";
         hr = g.dev12->CreateSharedHandle(g.tex12[i], nullptr, GENERIC_ALL, nullptr, &g.shared[i]);
+    }
     if (SUCCEEDED(hr))
+    {
+        step = "OpenSharedResource1";
         hr = dev1->OpenSharedResource1(g.shared[i], __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&g.tex11[i]));
+    }
     if (SUCCEEDED(hr))
     {
         Log("[feed] %-6s %ux%u %s via D3D12->D3D11", kSlotName[i], w, h, FormatName(fmt));
         return true;
     }
-    Log("[feed] %s: D3D12->D3D11 path failed 0x%08X, trying the other direction", kSlotName[i], hr);
+    Log("[feed] %s: D3D12->D3D11 path failed at %s 0x%08X (%s)%s, trying the other direction",
+        kSlotName[i], step, hr, FeedHrName(hr), uav ? " [this slot carries a UAV bind]" : "");
     SafeRelease(g.tex11[i]);
     SafeRelease(g.tex12[i]);
     if (g.shared[i] != nullptr) { CloseHandle(g.shared[i]); g.shared[i] = nullptr; }
@@ -2825,7 +2883,12 @@ static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORM
                           (render_target ? D3D11_BIND_RENDER_TARGET : 0);
     td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
     hr = dev1->CreateTexture2D(&td, nullptr, &g.tex11[i]);
-    if (FAILED(hr)) { Log("[feed] %s: CreateTexture2D failed 0x%08X", kSlotName[i], hr); return false; }
+    if (FAILED(hr))
+    {
+        Log("[feed] %s: CreateTexture2D failed 0x%08X (%s)%s", kSlotName[i], hr, FeedHrName(hr),
+            uav ? " -- this slot carries a UAV bind, and it is the only one that does" : "");
+        return false;
+    }
 
     IDXGIResource1 *dxgi_res = nullptr;
     hr = g.tex11[i]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&dxgi_res));
@@ -2837,7 +2900,11 @@ static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORM
     }
     if (SUCCEEDED(hr))
         hr = g.dev12->OpenSharedHandle(g.shared[i], __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.tex12[i]));
-    if (FAILED(hr)) { Log("[feed] %s: D3D11->D3D12 path failed 0x%08X", kSlotName[i], hr); return false; }
+    if (FAILED(hr))
+    {
+        Log("[feed] %s: D3D11->D3D12 path failed 0x%08X (%s)", kSlotName[i], hr, FeedHrName(hr));
+        return false;
+    }
 
     D3D12_RESOURCE_DESC got = g.tex12[i]->GetDesc();
     Log("[feed] %-6s %ux%u %s via D3D11->D3D12 (d3d12 flags=0x%X%s)", kSlotName[i], w, h, FormatName(fmt), got.Flags,
@@ -3078,13 +3145,59 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
             g.sr_quality_name, w, h, backbuffer_w, backbuffer_h, g.jitter_phases, g_cfg.jitter_sign);
     }
 
-    bool ok = MakeSharedPair(dev1, SLOT_COLOR,  w, h, g.color_fmt,             false, true)  &&
-              MakeSharedPair(dev1, SLOT_OUTPUT, g.output_width, g.output_height, g.output_fmt, true, false) &&
+    // Output first, on its own, because it is the only slot that carries a UAV bind and so
+    // the only one a device can refuse for that reason alone (#70). When it fails, retry it
+    // without the UAV and give NGX a private target instead -- the route the 32-bit add-on
+    // and the 64-bit helper have both had for a while, and the in-process path never did.
+    SafeRelease(g.out_scratch);
+    bool out_ok = MakeSharedPair(dev1, SLOT_OUTPUT, g.output_width, g.output_height, g.output_fmt, true, false);
+    if (!out_ok)
+    {
+        const D3D_FEATURE_LEVEL fl = g.dev11 != nullptr ? g.dev11->GetFeatureLevel() : D3D_FEATURE_LEVEL_11_0;
+        Log("[feed] Output is the only shared texture with an unordered-access bind, and this "
+            "D3D11 device (feature level %d_%d) refused it. Rebuilding it without the UAV and "
+            "keeping DLSS's write target on our own device.", (fl >> 12) & 0xF, (fl >> 8) & 0xF);
+        // ALLOW_RENDER_TARGET, not nothing: a texture created with no bind capability at all is
+        // the one a D3D11 opener will not open either, which is what #43 turned out to be.
+        out_ok = MakeSharedPair(dev1, SLOT_OUTPUT, g.output_width, g.output_height, g.output_fmt, false, true);
+        if (out_ok)
+        {
+            D3D12_HEAP_PROPERTIES hp = {};
+            hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC rd = {};
+            rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            rd.Width            = g.output_width;
+            rd.Height           = g.output_height;
+            rd.DepthOrArraySize = 1;
+            rd.MipLevels        = 1;
+            rd.Format           = g.output_fmt;
+            rd.SampleDesc.Count = 1;
+            rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                                  D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+            const HRESULT shr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 __uuidof(ID3D12Resource),
+                                                                 reinterpret_cast<void **>(&g.out_scratch));
+            if (FAILED(shr))
+            {
+                Log("[feed] the private DLSS output texture failed 0x%08X (%s)", shr, FeedHrName(shr));
+                out_ok = false;
+            }
+            else
+                Log("[feed] Output  %ux%u %s: shared copy without UAV, DLSS writes a private texture",
+                    g.output_width, g.output_height, FormatName(g.output_fmt));
+        }
+    }
+
+    bool ok = out_ok &&
+              MakeSharedPair(dev1, SLOT_COLOR,  w, h, g.color_fmt,             false, true)  &&
               MakeSharedPair(dev1, SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, true)  &&
               MakeSharedPair(dev1, SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, true) &&
               MakeSharedPair(dev1, SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false, true);
     dev1->Release();
     if (!ok) { ReleaseFrameResources(); return false; }
+    FeedNameD3D12Objects();   // the shared textures exist now; name them for DRED (#63)
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
     sv.Format              = g.output_fmt;
@@ -3388,6 +3501,54 @@ static void FeedDrainInfoQueue(const char *when)
         free(msg);
     }
     if (n != 0) g_info_queue->ClearStoredMessages();
+}
+
+// Give every D3D12 object this add-on owns a debug name.
+//
+// The device has been named since the DRED work landed, and nothing else ever was -- so a
+// hang inside our own queue came back as `queue='(unnamed)' list='(unnamed)'` and there was
+// no way to tell our submissions from the game's (#63, #57). One SetName per object turns the
+// same dump into an attributable one. Called after each opener finishes building the ring;
+// safe to call twice and safe with null members, which is what the openers rely on.
+static void FeedNameD3D12Objects()
+{
+    if (g.queue != nullptr) g.queue->SetName(L"dlss5-feed queue");
+    if (g.list  != nullptr) g.list->SetName(L"dlss5-feed command list");
+    if (g.fence12 != nullptr) g.fence12->SetName(L"dlss5-feed fence");
+    for (int i = 0; i < Feed::kFrames; ++i)
+    {
+        if (g.alloc[i] == nullptr) continue;
+        wchar_t n[64];
+        _snwprintf_s(n, _TRUNCATE, L"dlss5-feed allocator %d", i);
+        g.alloc[i]->SetName(n);
+    }
+    if (g.out_scratch != nullptr) g.out_scratch->SetName(L"dlss5-feed Output (private UAV)");
+    static const wchar_t *kSlotNameW[SLOT_COUNT] = { L"Color", L"Output", L"Depth", L"MV", L"Mask" };
+    for (int i = 0; i < SLOT_COUNT; ++i)
+    {
+        if (g.tex12[i] == nullptr) continue;
+        wchar_t n[64];
+        _snwprintf_s(n, _TRUNCATE, L"dlss5-feed %s", kSlotNameW[i]);
+        g.tex12[i]->SetName(n);
+    }
+}
+
+// Phase brackets inside the recorded list. Without them a breadcrumb like
+// "op[55] ResourceBarrier" cannot be placed: this add-on records five barriers of its own and
+// NGX records dozens more into the SAME list during its evaluate, and they are indistinguishable
+// in the trail (#63). With them, a DRED dump names the phase that hung.
+//
+// BeginEvent/EndEvent on a command list take a PIX-format blob; the two-arg form below is the
+// documented "string" encoding (metadata 1 = UTF-8, 2 = UTF-16) that DRED and PIX both read.
+static void FeedBeginPhase(ID3D12GraphicsCommandList *list, const wchar_t *name)
+{
+    if (list == nullptr || name == nullptr) return;
+    list->BeginEvent(2, name, static_cast<UINT>((wcslen(name) + 1) * sizeof(wchar_t)));
+}
+
+static void FeedEndPhase(ID3D12GraphicsCommandList *list)
+{
+    if (list != nullptr) list->EndEvent();
 }
 
 static void FeedEnableDred()
@@ -3739,7 +3900,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             goto fail;
         }
         Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
-        if (NVSDK_NGX_FAILED(r)) { Log("[feed] NGX would not initialise on this device/driver"); goto fail; }
+        if (NVSDK_NGX_FAILED(r)) { Log("[feed] %s", NgxFailureReason()); goto fail; }
         g.ngx_inited = true;
 
         NVSDK_NGX_Parameter *caps = nullptr;
@@ -3777,6 +3938,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
             dev5->Release();
         }
         if (fh != nullptr) CloseHandle(fh);
+        FeedNameD3D12Objects();
         if (FAILED(hr) || g.fence11 == nullptr) { Log("[feed] shared fence setup failed 0x%08X", hr); goto fail; }
 
         if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))) || g.ctx4 == nullptr)
@@ -3937,7 +4099,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
-        FeedDisable("NGX would not initialise on the game's device");
+        FeedDisable(NgxFailureReason());
         return false;
     }
     g.ngx_inited = true;
@@ -3976,6 +4138,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
     if (g.list != nullptr) g.list->Close();
     g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    FeedNameD3D12Objects();
     if (g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
     {
         Log("[feed] D3D12 list/fence creation failed");
@@ -4122,7 +4285,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
-        FeedDisable("NGX would not initialise");
+        FeedDisable(NgxFailureReason());
         return false;
     }
     g.ngx_inited = true;
@@ -4160,6 +4323,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     if (g.list != nullptr) g.list->Close();
     g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    FeedNameD3D12Objects();
     if (g.queue == nullptr || g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
     {
         Log("[feed] D3D12 queue/list/fence creation failed");
@@ -4509,7 +4673,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     if (NVSDK_NGX_FAILED(r))
     {
         ShutdownSession();
-        FeedDisable("NGX would not initialise");
+        FeedDisable(NgxFailureReason());
         return false;
     }
     g.ngx_inited = true;
@@ -4547,6 +4711,7 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     if (g.list != nullptr) g.list->Close();
     g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    FeedNameD3D12Objects();
     if (g.queue == nullptr || g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
     {
         Log("[feed] D3D12 queue/list/fence creation failed");
@@ -5639,12 +5804,14 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             const bool sig_ok = g.rs_queue->signal(g.rs_fence_in, n);
 
             // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
-            g.queue->Wait(g.fence12_in, n);
-            CK("queue Wait(fence12_in)");
             bool done = false;
             if (!BeginCommands()) FeedFail("command list");
             else
             {
+                // Enqueued only once the list is open: a Wait left on the queue after a failed
+                // BeginCommands sits on a queue that is already stuck (#63).
+                g.queue->Wait(g.fence12_in, n);
+                CK("queue Wait(fence12_in)");
                 if (g.in_buf12[SLOT_COLOR] != nullptr && g_cfg.mode >= 2)
                 {
                     // buffer_home inputs: the Vulkan side wrote the shared buffers;
@@ -6117,11 +6284,13 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
             }
 
             // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
-            g.queue->Wait(g.fence12_in, n);
             bool done = false;
             if (!BeginCommands()) FeedFail("command list");
             else
             {
+                // Enqueued only once the list is open: a Wait left on the queue after a failed
+                // BeginCommands sits on a queue that is already stuck (#63).
+                g.queue->Wait(g.fence12_in, n);
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
@@ -6341,9 +6510,14 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
     if (ok && needs_build11)
     {
-        Log("[feed] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s (mv %s, depth %s, depth reversed=%d)",
+        // The feature level belongs on this line: it is what decides whether the Output's UAV
+        // bind can be shared at all, and the 32-bit side has logged it since #43 (#70).
+        const D3D_FEATURE_LEVEL bfl = g.dev11 != nullptr ? g.dev11->GetFeatureLevel() : D3D_FEATURE_LEVEL_11_0;
+        Log("[feed] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s (mv %s, depth %s, "
+            "depth reversed=%d, feature level %d_%d)",
             work_w, work_h, g_cfg.work_resolution, cd.Width, cd.Height, FormatName(cd.Format),
-            FormatName(md.Format), FormatName(dd.Format), g.depth_reversed ? 1 : 0);
+            FormatName(md.Format), FormatName(dd.Format), g.depth_reversed ? 1 : 0,
+            (bfl >> 12) & 0xF, (bfl >> 8) & 0xF);
         ok = BuildResources(work_w, work_h, cd.Width, cd.Height, cd.Format);
         if (!ok) FeedFail("resource build");
         else g.consecutive_fails = 0;
@@ -6378,25 +6552,35 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
             const UINT64 v_in = ++g.fence_value;
             g.ctx4->Signal(g.fence11, v_in);
             ctx->Flush();
-            g.queue->Wait(g.fence12, v_in);
 
             if (!BeginCommands()) { FeedFail("command list"); ok = false; }
             else
             {
+                // The wait belongs INSIDE the success branch. It used to be enqueued before
+                // BeginCommands, so a failed BeginCommands -- exactly what #63 saw, after the
+                // GPU stopped retiring allocator slots -- left a Wait sitting on a queue that
+                // was already stuck, and the feed kept re-arming against it every frame.
+                g.queue->Wait(g.fence12, v_in);
+                FeedBeginPhase(g.list, L"dlss5-feed copy-in");
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                  g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                // #70: when the device refused a shared UAV texture, DLSS writes our private
+                // one and the shared Output receives a copy below. Only the resource NGX
+                // actually writes gets promoted to UNORDERED_ACCESS.
+                ID3D12Resource *const nr_out = g.out_scratch != nullptr ? g.out_scratch : g.tex12[SLOT_OUTPUT];
+                Barrier(nr_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                FeedEndPhase(g.list);
 
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
                 g.need_reset = false;
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
                 ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
-                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.pInOutput = nr_out;
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = g.tex12[SLOT_DEPTH];
                 ep.pInMotionVectors  = g.tex12[SLOT_MV];
@@ -6415,7 +6599,12 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
                 Breadcrumb("running the D3D12 evaluate");
                 DWORD ecode = 0;
+                // Everything NGX records goes between these two markers, so a DRED breadcrumb
+                // that faults inside the evaluate is distinguishable from one that faults in
+                // this add-on's own barriers (#63).
+                FeedBeginPhase(g.list, L"dlss5-feed ngx-evaluate");
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                if (ecode == 0) FeedEndPhase(g.list);
 
                 if (ecode != 0)
                 {
@@ -6427,11 +6616,23 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
                 else
                 {
+                FeedBeginPhase(g.list, L"dlss5-feed copy-home");
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                if (g.out_scratch != nullptr)
+                {
+                    // #70: land the private result in the shared texture the game opened. The
+                    // shared target is promoted to COPY_DEST implicitly (SIMULTANEOUS_ACCESS),
+                    // and both decay to COMMON when this submission completes -- the same shape
+                    // the 64-bit helper uses for D3D11 clients that cannot open a UAV texture.
+                    Barrier(g.out_scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.out_scratch);
+                }
+                else
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                FeedEndPhase(g.list);
                 const UINT64 v_out = EndCommands();
 
                 if (NVSDK_NGX_FAILED(re))
@@ -6478,6 +6679,33 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
+// #62: the Vulkan transport had no fault guard at all.
+//
+// Every __try in this project is around an NGX call, because that is where faults were
+// expected. But src/feed_vk.h imports D3D12 memory into the game's device and records raw
+// vkCmd* into ReShade's command buffer, and a fault anywhere in there -- a stale VkImage
+// after a device recreation, a trampoline freed under a call on exit -- went straight to
+// the game with nothing between. A crash the feed causes should disable the feed, not the
+// game.
+//
+// A separate function because /EHsc forbids __try in a frame with unwindable objects, and
+// FeedFrameVk is full of them.
+static void FeedFrameVkGuarded(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
+                               reshade::api::resource_view rtv)
+{
+    __try
+    {
+        FeedFrameVk(rt, cl, rtv);
+    }
+    __except (NoteNgxFault("the Vulkan transport", GetExceptionInformation()), EXCEPTION_EXECUTE_HANDLER)
+    {
+        // The command buffer is ReShade's, not ours, and we cannot know how much of this
+        // frame was recorded -- so stop feeding rather than record another one.
+        g.frame_ready = false;
+        FeedDisable("the Vulkan transport faulted (the feed is off; the game keeps running)");
+    }
+}
+
 static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
                               reshade::api::resource_view rtv)
 {
@@ -6485,7 +6713,7 @@ static void FeedFrameDispatch(reshade::api::effect_runtime *rt, reshade::api::co
     {
     case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
     case reshade::api::device_api::d3d12: FeedFrame12(rt, cl, rtv); break;
-    case reshade::api::device_api::vulkan: FeedFrameVk(rt, cl, rtv); break;
+    case reshade::api::device_api::vulkan: FeedFrameVkGuarded(rt, cl, rtv); break;
     case reshade::api::device_api::opengl: FeedFrameGl(rt, cl, rtv); break;
     default: FeedDisable("only Direct3D 11/12, Vulkan and OpenGL games are supported"); break;
     }
@@ -6886,6 +7114,11 @@ static void OnDestroyDevice(reshade::api::device *dev)
         // Vulkan requires the application to have retired work before this point.
         g.rs_queue = nullptr;
         ShutdownSession();
+        // #62: disable the vulkan-1 detours and wait for anything already inside them to
+        // leave, HERE -- where waiting is legal. DllMain runs under the loader lock and
+        // cannot wait, and freeing a trampoline with a call still standing on it is an
+        // execute fault at an unmapped address on exit, which is what X4 reports.
+        FeedVkHookQuiesceOnDeviceDestroy();
     }
     else if (g.session_ready && dev->get_api() == reshade::api::device_api::opengl && dev == g.rs_dev)
     {

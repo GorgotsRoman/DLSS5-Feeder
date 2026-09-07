@@ -93,8 +93,37 @@ static volatile LONG64       g_vk_feed_frames;
 // decaying to 1.01x as the honest 1:1 ratio outgrew the ~68-present head start).
 static volatile LONG64       g_vk_presents_base;
 
+// ---------------------------------------------------------------------------
+// Keeping a trampoline alive while somebody is standing on it (#62).
+//
+// MH_RemoveHook frees the trampoline MinHook allocated for the original bytes. If any
+// other thread is inside one of the hook bodies below at that moment -- past the null
+// check, about to call through -- it calls a freed, unmapped address. That is an
+// EXECUTE access violation at an address in no loaded module, on the feed thread, with
+// the graphics DLLs still on the stack: exactly what X4 Foundations reports on "Exit to
+// Desktop", and exactly what a log saying "hook removed / shut down cleanly" is unable
+// to rule out, because the teardown DID run -- just not in an order that guaranteed
+// nothing was still in flight.
+//
+// So: count entries, and let the teardown DISABLE first (MH_DisableHook puts the original
+// bytes back, so no new call can reach these bodies at all), then wait for the count to
+// fall to zero, and only then free. The counter does not need to gate anything itself --
+// disabling is what closes the door; the count is what tells us the room is empty.
+// ---------------------------------------------------------------------------
+static volatile LONG  g_vk_hook_inflight;   // threads currently inside a hook body
+
+struct FeedVkHookGate
+{
+    FeedVkHookGate()  { InterlockedIncrement(&g_vk_hook_inflight); }
+    ~FeedVkHookGate() { InterlockedDecrement(&g_vk_hook_inflight); }
+};
+
 static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
 {
+    // Holds the trampoline alive for the duration of this call (#62).
+    FeedVkHookGate gate;
+    const PFN_vkQueuePresentKHR orig = g_vk_present_orig;
+    if (orig == nullptr) return VK_SUCCESS;   // torn down under us; nothing safe to call
     const LONG64 presents = InterlockedIncrement64(&g_vk_presents);
     if (pPresentInfo != nullptr && pPresentInfo->swapchainCount > 0 && pPresentInfo->pImageIndices != nullptr)
         g_vk_last_image = pPresentInfo->pImageIndices[0];
@@ -115,7 +144,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookQueuePresent(VkQueue queue, cons
             static_cast<long long>(since), static_cast<long long>(fed),
             fed > 0 ? static_cast<double>(since) / static_cast<double>(fed) : 0.0);
     }
-    return g_vk_present_orig(queue, pPresentInfo);
+    return orig(queue, pPresentInfo);
 }
 
 // Called by the feed once per delivered frame; also drives the periodic report.
@@ -140,8 +169,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
                                                              const VkAllocationCallbacks *pAllocator,
                                                              VkDevice *pDevice)
 {
+    // Holds the trampoline alive for the duration of this call (#62).
+    FeedVkHookGate gate;
+    const PFN_vkCreateDevice orig_create = g_vk_create_device_orig;
+    if (orig_create == nullptr) return VK_ERROR_INITIALIZATION_FAILED;   // torn down under us
     ++g_vk_hook_devices;
-    if (pCreateInfo == nullptr) return g_vk_create_device_orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    if (pCreateInfo == nullptr) return orig_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
 
     // What does the driver actually offer? The enumerate entry point is a plain
     // vulkan-1.dll export; no GIPA needed.
@@ -251,13 +284,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice ph
             already(want) ? "(app)" : driver_has(want) ? "ADDED" : "unsupported by driver");
 
     g_vk_phys = physicalDevice;
-    VkResult r = g_vk_create_device_orig(physicalDevice, &ci, pAllocator, pDevice);
+    VkResult r = orig_create(physicalDevice, &ci, pAllocator, pDevice);
     if (r != VK_SUCCESS && (added > 0 || !have_timeline_feature))
     {
         // A driver that advertised an extension but refuses it is not worth arguing
         // with: retry untouched so the hook can never stop a game from starting.
         Log("[feed] vkCreateDevice failed (%d) with the added extensions; retrying with the app's original create info", r);
-        r = g_vk_create_device_orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
+        r = orig_create(physicalDevice, pCreateInfo, pAllocator, pDevice);
     }
     Log("[feed] vkCreateDevice -> %d", r);
     return r;
@@ -327,18 +360,70 @@ static bool FeedVkHookInstall()
     return true;
 }
 
+// Close the door and wait for the room to empty (#62).
+//
+// Disabling restores the original bytes, so no NEW call can enter a hook body; the
+// in-flight count then tells us when the threads already inside have left. Only after
+// that is it safe to free the trampolines.
+//
+// Call this from the device-destroy path, where waiting is legal. FeedVkHookRemove runs
+// from DllMain, where it is not: there it degrades to a short bounded spin, which is
+// still better than freeing under a live call, but the real fix is to have quiesced
+// already by the time the DLL goes away.
+static void FeedVkHookQuiesce(int budget_ms)
+{
+    if (g_vk_present_target != nullptr)       MH_DisableHook(g_vk_present_target);
+    if (g_vk_create_device_target != nullptr) MH_DisableHook(g_vk_create_device_target);
+
+    // Sleep(0)/yield rather than a lock: this can run under the loader lock, where taking
+    // any lock a hook body might hold is how a shutdown deadlocks instead of crashing.
+    for (int waited = 0; waited < budget_ms; ++waited)
+    {
+        if (InterlockedCompareExchange(&g_vk_hook_inflight, 0, 0) == 0) return;
+        Sleep(1);
+    }
+    if (InterlockedCompareExchange(&g_vk_hook_inflight, 0, 0) != 0)
+        Log("[feed] Vulkan hooks: %ld call(s) still inside after %d ms; not freeing the trampolines",
+            static_cast<long>(g_vk_hook_inflight), budget_ms);
+}
+
+// Called when the game's device goes away, while it is still legal to wait. By the time
+// DllMain runs, this has already done the waiting.
+static void FeedVkHookQuiesceOnDeviceDestroy()
+{
+    if (g_vk_create_device_target == nullptr && g_vk_present_target == nullptr) return;
+    FeedVkHookQuiesce(200);
+}
+
 // From DllMain(DLL_PROCESS_DETACH). See the header comment for why this is mandatory.
 static void FeedVkHookRemove()
 {
     if (g_vk_create_device_target == nullptr) return;
+
+    // Disable and drain BEFORE freeing anything. Short budget: this runs under the loader
+    // lock. FeedVkHookQuiesceOnDeviceDestroy has normally drained it already.
+    FeedVkHookQuiesce(50);
+    if (InterlockedCompareExchange(&g_vk_hook_inflight, 0, 0) != 0)
+    {
+        // Leaving the hooks disabled-but-not-removed is the lesser evil ONLY if this DLL
+        // stays mapped, which at DLL_PROCESS_DETACH it does not. Freeing under a live call
+        // is what #62 crashes on, so prefer leaking the trampoline: the detour bytes are
+        // already restored, so nothing jumps into this module any more.
+        Log("[feed] Vulkan hooks: unloading with calls still in flight; the detours are disabled "
+            "but the trampolines are deliberately not freed");
+        g_vk_present_target       = nullptr;
+        g_vk_present_orig         = nullptr;
+        g_vk_create_device_target = nullptr;
+        g_vk_create_device_orig   = nullptr;
+        return;
+    }
+
     if (g_vk_present_target != nullptr)
     {
-        MH_DisableHook(g_vk_present_target);
         MH_RemoveHook(g_vk_present_target);
         g_vk_present_target = nullptr;
         g_vk_present_orig   = nullptr;
     }
-    MH_DisableHook(g_vk_create_device_target);
     MH_RemoveHook(g_vk_create_device_target);
     MH_Uninitialize();
     g_vk_create_device_target = nullptr;

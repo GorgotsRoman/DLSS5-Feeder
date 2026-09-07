@@ -1354,6 +1354,34 @@ static void CopyPanel()
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 
+// #58: the helper dies with 0xC0000005 immediately after the game side reports releasing a
+// button it still believed the host was holding. Those releases arrive here as synthesized
+// WM_*BUTTONUP / WM_KEYUP and are dispatched into ReShade's window procedure and ImGui --
+// third-party code, in a window that the resize path may have rebuilt underneath it.
+//
+// This does not pretend to know the root cause; it stops one fault in a dispatched message
+// from taking the helper (and with it the game's feed) down, and names it in the log, which
+// is what the report needs before anything more precise can be written. Everything the drain
+// touches is a plain MSG, so there is nothing here for /EHsc to refuse to unwind.
+static volatile LONG g_pump_faults;
+
+static void PumpMessagesGuarded()
+{
+    __try
+    {
+        MSG msg;
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        const LONG n = InterlockedIncrement(&g_pump_faults);
+        if (n <= 3)
+            Log("[host] a window message faulted with 0x%08X while being dispatched (caught, #%ld). If this "
+                "repeats, it is issue #58 -- please attach this log and dlss5-feed-crash.dmp",
+                GetExceptionCode(), static_cast<long>(n));
+    }
+}
+
 // The message drain always runs -- it is what keeps the window responsive. When idle
 // (no frames arriving), the banner copy and the Present behind it are throttled to
 // 30 Hz; what made the old per-frame call expensive was the CPU wait for our own
@@ -1366,8 +1394,7 @@ typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
 // needs in order to pay the debt down one at a time.
 static bool PumpPresent(bool force = false)
 {
-    MSG msg;
-    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    PumpMessagesGuarded();
     if (h.swap == nullptr) return false;
 
     // Open ReShade's overlay for the user once the window is up: key down on one pump, key
@@ -1740,6 +1767,11 @@ static void LogHostAdapter()
 // Ask NGX which of the adapter, the driver or the OS it is objecting to. Same question the
 // add-on asks through its own NgxAskWhy; kept symmetrical on purpose, because issue #47 is
 // built on comparing what the two sides report.
+
+// What the probe concluded, so the failure line can be written from what NGX actually said
+// rather than a catch-all that blames the device (#47, #73). Symmetrical with the add-on.
+static FeedNgxVerdict g_ngx_verdict = {};
+
 static void NgxAskWhy(const wchar_t *data_path, const NVSDK_NGX_FeatureCommonInfo *info)
 {
     if (h.dev == nullptr) return;
@@ -1755,7 +1787,7 @@ static void NgxAskWhy(const wchar_t *data_path, const NVSDK_NGX_FeatureCommonInf
                               reinterpret_cast<void **>(&ad));
         f4->Release();
     }
-    FeedLogNgxFeatureRequirements(&Log, "host", ad, data_path, info);
+    FeedLogNgxFeatureRequirements(&Log, "host", ad, data_path, info, &g_ngx_verdict);
     if (ad != nullptr) ad->Release();
 }
 
@@ -1836,6 +1868,9 @@ static bool InitNgx()
         else
             Log("[host] NGX Core: the HKLM NGXCore key could not be opened -- the driver's NGX runtime may not be installed");
 
+        // Say what NGX actually objected to. Everything above is evidence; this is the verdict,
+        // and it is the line a reporter quotes (#47, #72, #73).
+        Log("[host] %s", FeedNgxWhyNot(g_ngx_verdict));
         return false;
     }
     h.ngx_inited = true;

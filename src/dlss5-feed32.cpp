@@ -58,7 +58,7 @@
 #include "feed_d3d10.h"     // D3D10.1 <-> D3D11 keyed-mutex bridge + the private relay device
 #include "feed_dfc.h"       // Deep Fried Chicken: only the file scan is used here (it lives in host64\)
 
-#define FEED_VERSION "0.14.0-beta.4"
+#define FEED_VERSION "0.14.0-beta.5"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -1420,7 +1420,11 @@ static void CastKeyName(int vk, char *out, size_t n)
 
 static void CastPostKey(UINT msg, UINT vk, bool up)
 {
-    if (g_cast_hwnd == nullptr) return;
+    // IsWindow, not just non-null: the host window can go away between the last layout pass
+    // and this call (a host restart, or a resize that recreated it), and the flush that runs
+    // when the panel comes down is the one place that is guaranteed to post into whatever
+    // handle was last seen (#58).
+    if (g_cast_hwnd == nullptr || !IsWindow(g_cast_hwnd)) return;
     const UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
     LPARAM lp = 1 | (static_cast<LPARAM>(scan) << 16);
     if (up) lp |= (1 << 30) | (1u << 31);
@@ -1442,8 +1446,10 @@ static void CastFlushInput()
     int keys = 0, buttons = 0;
     for (UINT vk = 0; vk < 256; ++vk)
         if (g_cast_key_down[vk]) { g_cast_key_down[vk] = false; ++keys; CastPostKey(WM_KEYUP, vk, true); }
-    if (g_cast_btn_down != 0 && g_cast_hwnd != nullptr)
+    if (g_cast_btn_down != 0 && g_cast_hwnd != nullptr && IsWindow(g_cast_hwnd))
     {
+        // Clamp, do not trust: g_cast_last is the last position inside the panel, and a
+        // resize can leave it outside the window it is about to be posted into (#58).
         const LPARAM at = MAKELPARAM(g_cast_last.x >= 0 ? g_cast_last.x : 0,
                                      g_cast_last.y >= 0 ? g_cast_last.y : 0);
         for (const auto &b : kCastButtons)
