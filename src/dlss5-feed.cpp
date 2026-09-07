@@ -140,6 +140,7 @@ static void Warn(const char *fmt, ...)
 #include "feed_ofa.h"
 #include "feed_velocity.h"
 #include "feed_early_color.h"
+#include "feed_async.h"
 #include "feed_adapt.h"
 #include "feed_lightstab.h"
 
@@ -987,6 +988,10 @@ static void CfgWriteDefault()
             "velocity_scale=%.3f\n"
             "early_color=%d\n"
             "early_color_cand=%d\n"
+            "async_feed=%d\n"
+            "key_async_feed=%d\n"
+            "hud_stats=%d\n"
+            "key_hud=%d\n"
             "log_detail=%d\n"
             "log_detail_every=%d\n"
             "light_stab=%d\n"
@@ -1008,6 +1013,7 @@ static void CfgWriteDefault()
             g_feed_ofa_cfg.enabled, g_feed_ofa_cfg.grid, g_feed_ofa_cfg.perf, g_feed_velocity_cfg.enabled,
             g_feed_velocity_cfg.cand, g_feed_velocity_cfg.decode, g_feed_velocity_cfg.scale,
             g_feed_early_color_cfg.enabled, g_feed_early_color_cfg.cand,
+            g_feed_async_cfg.enabled, g_feed_async_cfg.key, g_feed_hud_cfg.enabled, g_feed_hud_cfg.key,
             g_feed_diag_cfg.enabled, g_feed_diag_cfg.every_n,
             g_feed_lightstab_cfg.enabled, g_feed_lightstab_cfg.strength, g_feed_lightstab_cfg.max_delta,
             g_feed_adapt_cfg.mask_thr, g_feed_adapt_cfg.mask_thr_vel, g_feed_adapt_cfg.luma_thr,
@@ -1098,6 +1104,10 @@ static bool CfgReload()
             g_feed_velocity_cfg.scale = (val < 0.05f) ? 0.05f : (val > 8.f ? 8.f : val);
         else if (_stricmp(key, "early_color") == 0) g_feed_early_color_cfg.enabled = iv ? 1 : 0;
         else if (_stricmp(key, "early_color_cand") == 0) g_feed_early_color_cfg.cand = iv;
+        else if (_stricmp(key, "async_feed") == 0) g_feed_async_cfg.enabled = iv ? 1 : 0;
+        else if (_stricmp(key, "key_async_feed") == 0) g_feed_async_cfg.key = iv > 0 ? iv : 0x79;
+        else if (_stricmp(key, "hud_stats") == 0) g_feed_hud_cfg.enabled = iv ? 1 : 0;
+        else if (_stricmp(key, "key_hud") == 0) g_feed_hud_cfg.key = iv > 0 ? iv : 0x78;
         else if (_stricmp(key, "log_detail") == 0) g_feed_diag_cfg.enabled = iv ? 1 : 0;
         else if (_stricmp(key, "log_detail_every") == 0) g_feed_diag_cfg.every_n = iv > 0 ? iv : 60;
         else if (_stricmp(key, "light_stab") == 0) g_feed_lightstab_cfg.enabled = iv ? 1 : 0;
@@ -1133,6 +1143,7 @@ static bool CfgReload()
     if (next.reset_mode < 0 || next.reset_mode > 2) next.reset_mode = FeedReset_Adaptive;
     if (next.reset_every) next.reset_mode = FeedReset_Every;
     g_feed_adapt_cfg.reset_mode = next.reset_mode;
+    FeedAsyncUpdateLagMetric();
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
                          next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
@@ -1165,6 +1176,7 @@ static const char *const kCfgSavedKeys[] = {
     "mv_scale_x", "mv_scale_y", "stall_log_ms",
     "ofa_enabled", "ofa_grid", "ofa_perf", "engine_velocity", "velocity_cand", "velocity_decode", "velocity_scale",
     "early_color", "early_color_cand",
+    "async_feed", "key_async_feed", "hud_stats", "key_hud",
     "log_detail", "log_detail_every", "light_stab", "light_stab_strength", "light_stab_max_delta",
     "adapt_mask_thr", "adapt_mask_thr_vel", "adapt_luma_thr", "evaluate_stride",
     "quality_preset", "auto_profile_applied", "auto_profile",
@@ -1225,6 +1237,7 @@ static void CfgSave()
             "ofa_enabled=%d\nofa_grid=%d\nofa_perf=%d\nengine_velocity=%d\n"
             "velocity_cand=%d\nvelocity_decode=%d\nvelocity_scale=%.3f\n"
             "early_color=%d\nearly_color_cand=%d\n"
+            "async_feed=%d\nkey_async_feed=%d\nhud_stats=%d\nkey_hud=%d\n"
             "log_detail=%d\nlog_detail_every=%d\n"
             "light_stab=%d\nlight_stab_strength=%.3f\nlight_stab_max_delta=%.3f\n"
             "adapt_mask_thr=%.3f\nadapt_mask_thr_vel=%.3f\nadapt_luma_thr=%.3f\n"
@@ -1238,6 +1251,7 @@ static void CfgSave()
             g_feed_ofa_cfg.enabled, g_feed_ofa_cfg.grid, g_feed_ofa_cfg.perf, g_feed_velocity_cfg.enabled,
             g_feed_velocity_cfg.cand, g_feed_velocity_cfg.decode, g_feed_velocity_cfg.scale,
             g_feed_early_color_cfg.enabled, g_feed_early_color_cfg.cand,
+            g_feed_async_cfg.enabled, g_feed_async_cfg.key, g_feed_hud_cfg.enabled, g_feed_hud_cfg.key,
             g_feed_diag_cfg.enabled, g_feed_diag_cfg.every_n,
             g_feed_lightstab_cfg.enabled, g_feed_lightstab_cfg.strength, g_feed_lightstab_cfg.max_delta,
             g_feed_adapt_cfg.mask_thr, g_feed_adapt_cfg.mask_thr_vel, g_feed_adapt_cfg.luma_thr,
@@ -2863,6 +2877,9 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 
 static void ReleaseFrameResources()
 {
+    // Async worker may still be reading/writing shared slots — wait briefly, then drop display.
+    for (int i = 0; i < 400 && FeedAsyncBusy(); ++i) Sleep(5);
+    FeedAsyncReleaseDisplay();
     // The private fence retires D3D12 only. Vulkan may still have copy-home
     // commands referencing these imports (including on the immediate list).
     if (g.vk.ok && g.rs_queue && (g.vk_img[SLOT_COLOR] || g_vk_probe.dev)) g.rs_queue->wait_idle();
@@ -4112,6 +4129,8 @@ fail:
 
 static void ShutdownSession()
 {
+    FeedAsyncShutdownWorker();
+    FeedAsyncReleaseDisplay();
     FeedOfaShutdown();
     FeedAdaptRelease();
     FeedLightStabRelease();
@@ -5158,7 +5177,8 @@ static void UpdateFsrConstants(ID3D11DeviceContext *ctx, UINT in_w, UINT in_h)
 // upsamples into easu_tex and RCAS sharpens from there into the backbuffer; at 100% EASU
 // has nothing to do and RCAS runs alone straight from the Output; with sharpness 0 EASU
 // writes the backbuffer directly. Either way the game and ReShade never see a size change.
-static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv)
+static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv,
+                                   ID3D11ShaderResourceView *src_override = nullptr)
 {
     // Save what we touch; ReShade rebinds its own state for every following pass anyway.
     ID3D11RenderTargetView   *old_rtv = nullptr;
@@ -5193,8 +5213,8 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     const UINT out_h = g.output_height != 0 ? g.output_height : g.height;
     const bool scaled = out_w != g.backbuffer_width || out_h != g.backbuffer_height;
     const bool fsr    = g_cfg.work_upscale != 0 && g.fsr_ok && g.easu_ps != nullptr;
-    const bool easu   = fsr && scaled && g.easu_rtv != nullptr;
-    const bool rcas   = fsr && g_cfg.work_sharpness > 0.0f && (easu || !scaled);   // RCAS reads at native texel indices
+    const bool easu   = fsr && scaled && g.easu_rtv != nullptr && src_override == nullptr;
+    const bool rcas   = fsr && g_cfg.work_sharpness > 0.0f && (easu || !scaled) && src_override == nullptr;
 
     D3D11_VIEWPORT vp = {};
     vp.Width    = static_cast<float>(g.backbuffer_width);
@@ -5215,7 +5235,7 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
         ctx->PSSetConstantBuffers(0, 1, &g.fsr_cb);
     }
 
-    ID3D11ShaderResourceView *src = g.output_srv;
+    ID3D11ShaderResourceView *src = src_override != nullptr ? src_override : g.output_srv;
     if (easu)
     {
         ID3D11RenderTargetView *target[] = { rcas ? g.easu_rtv : rtv };
@@ -5258,6 +5278,8 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
 // Per frame
 // ---------------------------------------------------------------------------
 
+#include "feed_hud.h"
+
 static void TimingTick(LONGLONG entry, LONGLONG exit)
 {
     if (g.qpf == 0)
@@ -5285,6 +5307,7 @@ static void TimingTick(LONGLONG entry, LONGLONG exit)
     {
         const double iv_ms = 1000.0 * double(interval) / double(g.qpf);
         FeedPerfTick(iv_ms);
+        FeedHudOnInterval(iv_ms);
     }
 
     if (interval > g.win_max_interval) g.win_max_interval = interval;
@@ -6540,6 +6563,140 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
 }
 
 // ---------------------------------------------------------------------------
+// D3D11 async feed: worker runs NGX evaluate off the Present thread.
+// ---------------------------------------------------------------------------
+
+static bool FeedAsyncEvaluateJob(float vel_scale_x, float vel_scale_y)
+{
+    if (!g.session_ready || g.feature == nullptr || g.ctx4 == nullptr || g.queue == nullptr)
+        return false;
+    if (g.dev11 == nullptr || g.tex11[SLOT_OUTPUT] == nullptr)
+        return false;
+
+    ID3D11DeviceContext *ctx = nullptr;
+    g.dev11->GetImmediateContext(&ctx);
+    if (ctx == nullptr)
+        return false;
+
+    FeedAsyncEnsureDisplay(g.dev11, g.tex11[SLOT_OUTPUT]);
+
+    bool ok = true;
+    if (!BeginCommands()) { FeedFail("command list"); ok = false; }
+    else
+    {
+        if (g_async_job_input_fence != 0)
+            g.queue->Wait(g.fence12, g_async_job_input_fence);
+        FeedBeginPhase(g.list, L"dlss5-feed copy-in");
+        Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        GuideProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                         g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ID3D12Resource *const nr_out = g.out_scratch != nullptr ? g.out_scratch : g.tex12[SLOT_OUTPUT];
+        Barrier(nr_out, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        FeedEndPhase(g.list);
+
+        const int reset = FeedAdaptResolveReset(g.need_reset);
+        g.need_reset = false;
+
+        NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+        ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+        ep.Feature.pInOutput = nr_out;
+        ep.Feature.InSharpness = 0.0f;
+        ep.pInDepth          = g.tex12[SLOT_DEPTH];
+        ep.pInMotionVectors  = g.tex12[SLOT_MV];
+        ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;
+        ep.InJitterOffsetX   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_x : 0.0f;
+        ep.InJitterOffsetY   = g.sr_active ? static_cast<float>(g_cfg.jitter_sign) * g.jitter_y : 0.0f;
+        ep.InRenderSubrectDimensions.Width  = g.width;
+        ep.InRenderSubrectDimensions.Height = g.height;
+        ep.InReset           = reset;
+        ep.InMVScaleX        = vel_scale_x;
+        ep.InMVScaleY        = vel_scale_y;
+        ep.InPreExposure     = 1.0f;
+        ep.InExposureScale   = 1.0f;
+
+        DWORD ecode = 0;
+        FeedBeginPhase(g.list, L"dlss5-feed ngx-evaluate");
+        NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+        if (ecode == 0) FeedEndPhase(g.list);
+
+        if (ecode != 0)
+        {
+            AbortCommands();
+            Log("[feed] async evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+            FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+            g.frame_ready = false;
+            ok = false;
+        }
+        else
+        {
+            FeedBeginPhase(g.list, L"dlss5-feed copy-home");
+            Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            if (g.out_scratch != nullptr)
+            {
+                Barrier(g.out_scratch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                g.list->CopyResource(g.tex12[SLOT_OUTPUT], g.out_scratch);
+            }
+            else
+                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+            FeedEndPhase(g.list);
+            const UINT64 v_out = EndCommands();
+
+            if (NVSDK_NGX_FAILED(re) || v_out == 0)
+            {
+                Log("[feed] async evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                FeedFail("evaluate");
+                g.frame_ready = false;
+                ok = false;
+            }
+            else
+            {
+                g.ctx4->Wait(g.fence11, v_out);
+                if (g.output_srv != nullptr)
+                {
+                    ID3D11ShaderResourceView *mv_work_srv = nullptr;
+                    if (g.tex11[SLOT_MV] != nullptr)
+                    {
+                        D3D11_SHADER_RESOURCE_VIEW_DESC svd = {};
+                        svd.Format = DXGI_FORMAT_R16G16_FLOAT;
+                        svd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                        svd.Texture2D.MipLevels = 1;
+                        g.dev11->CreateShaderResourceView(g.tex11[SLOT_MV], &svd, &mv_work_srv);
+                    }
+                    const UINT ow = g.output_width != 0 ? g.output_width : g.width;
+                    const UINT oh = g.output_height != 0 ? g.output_height : g.height;
+                    FeedLightStabApply(g.dev11, ctx, g.tex11[SLOT_OUTPUT], g.output_srv,
+                                       g.tex11[SLOT_MV], mv_work_srv, ow, oh);
+                    if (mv_work_srv) mv_work_srv->Release();
+                }
+                FeedAsyncCopyOutputToDisplay(ctx);
+                const UINT64 n = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (g.sr_active) ++g.jitter_index;
+                FeedDiagOnFrame(n, reset, g.mask_ok, g.backbuffer_width, g.backbuffer_height, g.width, g.height);
+                if (WarmupRebuildDue(n))
+                {
+                    g.warmup_done = true;
+                    g.frame_ready = false;
+                    Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, async)", n);
+                }
+            }
+        }
+    }
+    ctx->Release();
+    return ok;
+}
+
+#define FEED_ASYNC_IMPL
+#include "feed_async.h"
+#undef FEED_ASYNC_IMPL
+
+// ---------------------------------------------------------------------------
 // Per frame, D3D11: the original private-device transport
 // ---------------------------------------------------------------------------
 
@@ -6547,6 +6704,9 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 {
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
+    FeedPollConfigHotkeys();
+    FeedAsyncNoteGameProc();
+    FeedAsyncUpdateLagMetric();
 
     reshade::api::device *dev_api = rt->get_device();
 
@@ -6556,6 +6716,8 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     if (ApplyPendingWorkResolution()) g.frame_ready = false;
     if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    const bool async_on = g_feed_async_cfg.enabled != 0 && g_cfg.mode >= 2;
 
     // Inputs from ReShade: the frame being processed, and the companion effect's guide textures.
     reshade::api::resource_view color_srv = {}, color_srgb = {}, mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
@@ -6747,6 +6909,21 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         else g.consecutive_fails = 0;
     }
 
+    // Async: if the worker still owns SLOT_*, skip capture/evaluate and only show N-1.
+    if (ok && async_on && FeedAsyncBusy())
+    {
+        if (FeedAsyncHasDisplay())
+            BlitOutputToBackbuffer(ctx, rtv11, g_async_display_srv);
+        SafeRelease(color);
+        SafeRelease(early_color);
+        SafeRelease(mv);
+        SafeRelease(depth);
+        SafeRelease(mask);
+        QueryPerformanceCounter(&t1);
+        TimingTick(t0.QuadPart, t1.QuadPart);
+        return;
+    }
+
     if (ok)
     {
         // work_upscale=2: this frame's grid shift. The sequence restarts with the DLSS
@@ -6794,6 +6971,21 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
             if (g.tex11[SLOT_OUTPUT] != nullptr)
                 BlitOutputToBackbuffer(ctx, rtv11);
             ++g.frames_done;
+        }
+        else if (ok && async_on)
+        {
+            // Fast path: capture done; kick worker; display last completed (N-1).
+            if (g.dev11 != nullptr && g.tex11[SLOT_OUTPUT] != nullptr)
+                FeedAsyncEnsureDisplay(g.dev11, g.tex11[SLOT_OUTPUT]);
+            const UINT64 v_in = ++g.fence_value;
+            g.ctx4->Signal(g.fence11, v_in);
+            ctx->Flush();
+            if (!FeedAsyncTrySubmit(vel_scale_x, vel_scale_y, v_in))
+            {
+                // Should be rare: busy race after the early-out above.
+            }
+            if (FeedAsyncHasDisplay())
+                BlitOutputToBackbuffer(ctx, rtv11, g_async_display_srv);
         }
         else if (ok)
         {
@@ -7506,6 +7698,42 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
         ImGui::TextDisabled("evaluate_stride=%d (half-rate duty)", g_feed_auto.evaluate_stride);
 
     ImGui::Separator();
+    ImGui::TextUnformatted("Async feed (D3D11)");
+    {
+        bool async_on = g_feed_async_cfg.enabled != 0;
+        if (ImGui::Checkbox("Async feed (~1 frame display lag)", &async_on))
+        {
+            g_feed_async_cfg.enabled = async_on ? 1 : 0;
+            FeedAsyncUpdateLagMetric();
+            dirty = true;
+        }
+        ImGui::SameLine(); HelpMarker(
+            "Present captures inputs only and does not wait on NGX Evaluate. "
+            "A worker on other cores finishes NR; the game shows the last completed frame (N-1). "
+            "display_lag_frames=1. Off by default. Hotkey: key_async_feed (default F10).\n\n"
+            "Vulkan: use async_home instead (already in cfg) — different mechanism; do not set async_feed on Vulkan.");
+        if (g_feed_async_cfg.enabled)
+            ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f),
+                               "Async feed ON · display lag ~1 frame");
+        else
+            ImGui::TextDisabled("display_lag_frames = %d", g_display_lag_frames);
+        if (rt != nullptr && rt->get_device()->get_api() == reshade::api::device_api::vulkan)
+            ImGui::TextDisabled("Vulkan tip: async_home=%d already covers present-path lag hiding.", g_cfg.async_home);
+    }
+    {
+        bool hud_on = g_feed_hud_cfg.enabled != 0;
+        if (ImGui::Checkbox("In-game HUD stats", &hud_on))
+        {
+            g_feed_hud_cfg.enabled = hud_on ? 1 : 0;
+            dirty = true;
+        }
+        ImGui::SameLine(); HelpMarker(
+            "Top-right FPS / CPU / GPU feed / async panel without opening full Home. "
+            "Also enable Add-ons → \"DLSS 5 Feed · HUD\" once so it draws with Home closed. "
+            "Hotkey: key_hud (default F9).");
+    }
+
+    ImGui::Separator();
     ImGui::TextUnformatted("Status");
     ImGui::Text("Session: %s", g.disabled ? "disabled" : g.session_ready ? "open" : "not started");
     if (g.disabled && g_disable_why[0])
@@ -8014,6 +8242,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::draw>(OnDraw);
         reshade::register_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
         reshade::register_overlay(nullptr, DrawOverlay);
+        reshade::register_overlay("DLSS 5 Feed · HUD", DrawFeedHudPanel);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
@@ -8031,6 +8260,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
             DeleteCriticalSection(&g_log_cs);
             return TRUE;
         }
+        reshade::unregister_overlay("DLSS 5 Feed · HUD", DrawFeedHudPanel);
         reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
@@ -8048,6 +8278,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         FeedVkFramePresentRemove();
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         g_ngx_dying = true;   // process is exiting: never call back into NGX
+        FeedAsyncShutdownWorker();
         ShutdownSession();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");
